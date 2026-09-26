@@ -1,0 +1,16 @@
+{
+  "name": "shoplite",
+  "version": "2.1.0",
+  "private": true,
+  "description": "Intentionally vulnerable demo store used by Evo Code",
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.3"
+  }
+}
