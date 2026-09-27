@@ -238,3 +238,87 @@ def print_fix_plan(console: Console, plan: Any) -> None:
     for note in plan.notes:
         console.write()
         console.info(note)
+
+
+def print_solve_report(console: Console, session: SolveSession, diff: str, changed: list[str]) -> None:
+    """What the issue was, what Evo Code found, what changed, and whether it is proven fixed."""
+    gate = session.gate or {}
+    verdict = gate.get("status", "not judged yet")
+    style = Style.BRIGHT_GREEN if verdict == GATE_PASS else (
+        Style.BRIGHT_YELLOW if verdict == GATE_UNKNOWN else Style.BRIGHT_RED)
+    console.heading(f"Solve report · {session.id}",
+                    f"{session.root} · {session.runner or 'no runner'} · verdict {verdict}")
+
+    console.write(console.paint("  The issue", Style.BOLD))
+    console.wrapped(session.analysis.get("title") or session.issue.splitlines()[0], indent=4)
+    if session.analysis.get("root_cause"):
+        console.wrapped(session.analysis["root_cause"], indent=4, style=Style.DIM)
+
+    console.write()
+    console.write(console.paint("  What Evo Code found", Style.BOLD))
+    for suspect in session.suspects[:3]:
+        where = f"{suspect['file']}:{suspect['line_start']}-{suspect['line_end']}"
+        symbol = f" `{suspect['symbol']}`" if suspect.get("symbol") else ""
+        console.wrapped(f"• {where}{symbol} — {'; '.join(suspect.get('reasons') or [])}", indent=4, subsequent=6)
+    baseline = session.baseline or {}
+    if baseline.get("status") == "failed":
+        console.wrapped(f"• reproduced the failure: {', '.join((baseline.get('failing') or [])[:2])}",
+                        indent=4, subsequent=6, style=Style.BRIGHT_CYAN)
+    elif baseline:
+        console.wrapped(f"• nothing failed at the start ({baseline.get('summary', baseline.get('status'))})",
+                        indent=4, subsequent=6, style=Style.DIM)
+
+    console.write()
+    console.write(console.paint("  How it was solved", Style.BOLD))
+    if not session.edits and not changed:
+        console.wrapped("• nothing has been changed yet", indent=4, style=Style.DIM)
+    for edit in session.edits:
+        kind = "patch" if edit["kind"] == "patch" else "rewrote"
+        console.wrapped(f"• {kind} {', '.join(edit['files'])}", indent=4, subsequent=6)
+    if changed:
+        console.wrapped(f"• files now differing from git HEAD: {', '.join(changed[:6])}", indent=4, subsequent=6)
+    if diff.strip():
+        console.write()
+        for line in diff.splitlines()[:60]:
+            if line.startswith("+++") or line.startswith("---") or line.startswith("diff "):
+                console.write(f"    {console.paint(line, Style.BOLD, Style.DIM)}")
+            elif line.startswith("+"):
+                console.write(f"    {console.paint(line, Style.BRIGHT_GREEN)}")
+            elif line.startswith("-"):
+                console.write(f"    {console.paint(line, Style.BRIGHT_RED)}")
+            elif line.startswith("@@"):
+                console.write(f"    {console.paint(line, Style.BRIGHT_MAGENTA)}")
+            else:
+                console.write(f"    {console.paint(line, Style.DIM)}")
+
+    console.write()
+    console.write(console.paint("  Proof", Style.BOLD))
+    if not gate:
+        console.wrapped(f"• not judged yet — run `./evo check --session {session.id}`", indent=4, style=Style.DIM)
+    else:
+        for check in gate.get("checks", []):
+            mark = status_symbol(console, "complete" if check["ok"] else "failed")
+            console.write(f"    {mark} {check['name'].ljust(10)} {check['detail']}")
+        for reason in gate.get("reasons", []):
+            console.wrapped(f"- {reason}", indent=6, subsequent=8, style=Style.DIM)
+    console.write()
+    console.write(f"  {console.paint(str(verdict).upper(), Style.BOLD, style)}")
+
+
+def report_payload(session: SolveSession, diff: str, changed: list[str]) -> dict[str, Any]:
+    gate = session.gate or {}
+    return {
+        "session": session.id,
+        "root": session.root,
+        "issue": session.issue,
+        "title": session.analysis.get("title"),
+        "root_cause": session.analysis.get("root_cause") or None,
+        "acceptance_criteria": session.analysis.get("acceptance_criteria", []),
+        "located": session.suspects[:3],
+        "baseline": session.baseline,
+        "edits": session.edits,
+        "changed_files": changed,
+        "diff": diff,
+        "gate": {"status": gate.get("status"), "checks": gate.get("checks", []), "reasons": gate.get("reasons", [])},
+        "solved": gate.get("status") == GATE_PASS,
+    }

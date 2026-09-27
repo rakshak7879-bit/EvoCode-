@@ -28,8 +28,10 @@ from evo_cli.solve_views import (
     print_sessions,
     print_solve_summary,
     print_suspects,
+    print_solve_report,
     print_test_report,
     read_text_argument,
+    report_payload,
     session_payload,
 )
 from orchestrator.solving import SolveError, SolveSession
@@ -60,7 +62,8 @@ from services import Services, build_services
 #: so a second terminal never interrupts an analysis that is still running.
 STALE_ANALYSIS_SECONDS = 30 * 60
 TREE_COMMANDS = {"tree", "orchestration"}
-SOLVE_COMMANDS = {"solve", "plan", "breakdown", "diff", "sessions", "test", "apply", "write", "check", "scan"}
+SOLVE_COMMANDS = {"solve", "plan", "breakdown", "report", "diff", "sessions", "test", "apply", "write", "check",
+                  "scan"}
 #: Exit codes the driving model can branch on.
 EXIT_OK, EXIT_ERROR, EXIT_GATE_FAILED, EXIT_TESTS_FAILED = 0, 1, 2, 3
 
@@ -168,6 +171,7 @@ def _add_solve_commands(sub: argparse._SubParsersAction) -> None:  # type: ignor
 
     for name, help_text in (("plan", "show the fix plan of a solve session"),
                             ("breakdown", "show the issue breakdown and suspect code"),
+                            ("report", "what the issue was, how it was solved and the proof"),
                             ("diff", "show the changes made in a solve session")):
         command = sub.add_parser(name, help=help_text)
         command.add_argument("--session", help="session id or prefix (default: the most recent)")
@@ -491,6 +495,14 @@ async def dispatch_solve(args: argparse.Namespace, services: Services, console: 
             print_suspects(console, session)
         print_plan(console, session)
         return EXIT_OK
+
+    if command == "report":
+        diff, changed = coordinator.diff(session), coordinator.changed_files(session)
+        if args.json:
+            console.write(json.dumps(report_payload(session, diff, changed), indent=2))
+        else:
+            print_solve_report(console, session, diff, changed)
+        return EXIT_OK if (session.gate or {}).get("status") == "pass" else EXIT_GATE_FAILED
 
     if command == "diff":
         patch = coordinator.diff(session)

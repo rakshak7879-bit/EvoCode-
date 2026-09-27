@@ -410,3 +410,36 @@ def test_gate_requires_a_test_when_nothing_failed_at_the_start(settings: Setting
                               "    assert join_lines(str(n) for n in range(3)) == '0\\n1\\n2'\n")
     with_test = services.solve.check(session)
     assert with_test.passed and any("coverage added in" in check["detail"] for check in with_test.checks)
+
+
+def test_report_explains_the_issue_and_the_proof(cli: Invoke, target: Path, tmp_path: Path) -> None:
+    """`report` answers: what was the issue, how was it solved, and what proves it."""
+    issue_file = tmp_path / "issue.md"
+    issue_file.write_text(ISSUE)
+    code, out, err = cli("--json", "solve", "--repo", str(target), "--issue-file", str(issue_file))
+    assert code == EXIT_OK, err
+    session = json.loads(out)["session"]
+
+    code, out, _ = cli("report", "--session", session)
+    assert code == EXIT_GATE_FAILED, "nothing has been fixed yet"
+    assert "not judged yet" in out and "reproduced the failure" in out
+
+    fixed = tmp_path / "fixed.py"
+    fixed.write_text(BUGGY.replace('    lines = text.replace("\\r\\n", "\\n").split("\\n")', FIX))
+    assert cli("--json", "write", "--session", session, "textlib.py", "--file", str(fixed))[0] == EXIT_OK
+    assert cli("--json", "check", "--session", session)[0] == EXIT_OK
+
+    code, out, _ = cli("report", "--session", session)
+    assert code == EXIT_OK
+    assert "split_lines" in out and "PASS" in out
+    assert "previously failing test(s) now pass" in out
+    assert "textlib.py" in out
+
+    code, out, _ = cli("--json", "report", "--session", session)
+    payload = json.loads(out)
+    assert payload["solved"] is True and payload["gate"]["status"] == "pass"
+    assert payload["located"][0]["symbol"] == "split_lines"
+    assert payload["baseline"]["status"] == "failed"
+    assert payload["edits"] and payload["edits"][0]["files"] == ["textlib.py"]
+    assert "-" in payload["diff"] and "+" in payload["diff"]
+    assert any("existing tests still pass" in item for item in payload["acceptance_criteria"])

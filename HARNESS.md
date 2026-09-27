@@ -156,10 +156,16 @@ called `test_runner.py` does not count.
 
 ```bash
 ./evo --json plan --session S        # the plan and breakdown again
+./evo --json report --session S      # what the issue was, how it was solved, and the proof
 ./evo --json diff --session S        # unified diff of the work so far
 ./evo --json sessions                # every session with its gate status
 ./evo --json check --session S --save-patch   # also writes a .patch file
 ```
+
+`report` is the one to read at the end of a run. It answers, in order: the issue and its
+acceptance criteria, the code Evo Code located and why, whether the failure was reproduced,
+what changed (with the diff), and the gate's verdict with each check. `--json` adds
+`"solved": true|false`. Exit code `0` when solved, `2` when not.
 
 ## Optional: deep security scanning with Strix
 

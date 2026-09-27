@@ -156,6 +156,7 @@ listed with the reason instead of being patched.
 ./evo test --covering            # run the tests the Test Scout found
 ./evo apply --patch fix.patch    # apply a unified diff
 ./evo check                      # the gate: exit 0 solved, exit 2 not yet
+./evo report                     # what the issue was, how it was solved, and the proof
 ./evo sessions                   # every solve session and its gate status
 ```
 
