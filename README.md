@@ -122,14 +122,17 @@ The CLI requires **Python 3.11+** (tested on 3.14). No Node.js, server, browser,
 ```bash
 git clone https://github.com/rakshak7879-bit/EvoCode-.git
 cd EvoCode-
-python3 -m venv backend/.venv
-backend/.venv/bin/pip install -r backend/requirements-dev.txt
+make install                       # or: python3 -m venv backend/.venv &&
+                                   #     backend/.venv/bin/pip install -r backend/requirements-dev.txt
 
 ./evo demo                         # bundled ShopLite demo + interactive shell
 ./evo analyze /path/to/repository  # local folder
 ./evo analyze repository.zip       # ZIP
 ./evo analyze https://github.com/owner/repo
 ```
+
+`make` lists every task (`make demo`, `make analyze REPO=…`, `make fix`, `make solve ISSUE=…`,
+`make test`, `make doctor` to check your environment).
 
 Inside the shell, try:
 
@@ -219,7 +222,7 @@ evo-code/
 │   │                   # source_service.py, test_runner.py (sandboxed), strix_adapter.py (optional)
 │   ├── verification/   # citations.py (anchor + verify, SHA-256)
 │   ├── llm/            # provider.py (DeepSeek / OpenAI / local), prompts.py (guardrails, redaction)
-│   └── tests/          # 93 pytest tests
+│   └── tests/          # 97 pytest tests
 ├── frontend/src/       # pages, views, components, hooks, lib, api.ts, types.ts (optional dashboard)
 ├── demo-repo/          # intentionally vulnerable ShopLite store
 ├── docs/screenshots/
@@ -229,9 +232,10 @@ evo-code/
 ## Testing
 
 ```bash
-cd backend && source .venv/bin/activate && pytest   # 93 tests: scanner, memory, verification, agents,
-                                                    # orchestration, CLI, solve harness, API
-cd frontend && npm run build                        # strict TypeScript check + production build
+make test              # 97 tests: scanner, memory, verification, agents, orchestration,
+                       # CLI, fixing, solve harness, API
+make build-frontend    # strict TypeScript check + production build of the optional dashboard
+make check-all         # both, what CI should run
 ```
 
 ## Security

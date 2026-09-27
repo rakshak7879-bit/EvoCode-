@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -191,8 +192,10 @@ def _add_solve_commands(sub: argparse._SubParsersAction) -> None:  # type: ignor
     write.add_argument("--file", help="file holding the new contents ('-' reads stdin)")
 
     fix = sub.add_parser("fix", help="propose and apply verified fixes for findings of an analysis")
-    fix.add_argument("repository_id", nargs="?", help="id or prefix (default: latest analysis)")
+    fix.add_argument("repository_id", nargs="?",
+                     help="id, prefix, URL or path (default: latest analysis). May be omitted before the goal.")
     fix.add_argument("goal", nargs="*", help='what to fix, e.g. "the hardcoded secrets" (default: all security)')
+    fix.add_argument("--goal", dest="goal_text", metavar="TEXT", help="what to fix (unambiguous form)")
     fix.add_argument("--yes", "-y", action="store_true", help="apply every verified patch without asking")
     fix.add_argument("--dry-run", action="store_true", help="only show the patches")
     fix.add_argument("--no-reanalyze", action="store_true", help="skip the re-analysis after applying")
@@ -547,11 +550,39 @@ async def dispatch_solve(args: argparse.Namespace, services: Services, console: 
     return EXIT_OK
 
 
+_REPOSITORY_REFERENCE = re.compile(r"^[0-9a-f]{6,32}$")
+
+
+def _looks_like_repository(value: str) -> bool:
+    """True when a word was clearly meant as a repository, not as part of a fix goal."""
+    if _REPOSITORY_REFERENCE.match(value) or "://" in value or value.endswith(".zip"):
+        return True
+    try:
+        return Path(value).expanduser().exists()
+    except OSError:
+        return False
+
+
 async def _fix(args: argparse.Namespace, services: Services, console: Console) -> int:
-    """Fixer Agent: propose verified patches for an analysis, then apply the approved ones."""
-    repo = resolve_repository(services.store, args.repository_id)
+    """Fixer Agent: propose verified patches for an analysis, then apply the approved ones.
+
+    The repository is optional and may be omitted entirely, so both
+    ``./evo fix REPO "goal"`` and ``./evo fix "goal"`` do what they look like.
+    """
+    reference, words = args.repository_id, list(args.goal)
+    repo = None
+    if reference:
+        try:
+            repo = resolve_repository(services.store, reference)
+        except ValueError:
+            if _looks_like_repository(reference):
+                raise
+            words.insert(0, reference)  # it was the start of the goal
+    if repo is None:
+        repo = resolve_repository(services.store, None)
+    goal = (args.goal_text or " ".join(words)).strip()
     applied, verified = await run_fix(
-        services, console, repo, " ".join(args.goal),
+        services, console, repo, goal,
         assume_yes=args.yes, dry_run=args.dry_run, reanalyze=not args.no_reanalyze, json_output=args.json,
     )
     if not verified and not args.dry_run:

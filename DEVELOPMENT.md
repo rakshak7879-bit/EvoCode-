@@ -14,6 +14,21 @@ git clone <repository-url> evo-code
 cd evo-code
 ```
 
+## Make targets
+
+A `Makefile` wraps the common tasks. `make` on its own lists them all.
+
+```bash
+make install        # create backend/.venv and install dependencies
+make doctor         # check Python, FTS5, venv, node, git and Strix
+make demo           # analyze the bundled repo and open the shell
+make test           # backend test suite
+make check-all      # backend tests + dashboard type-check and build
+make clean          # caches and build output; make clean-data drops stored analyses
+```
+
+Every target works without make too; they are thin wrappers around `./evo` and `pytest`.
+
 ## Backend
 
 ```bash
@@ -72,9 +87,10 @@ cp .env.example .env
 ## Tests
 
 ```bash
+make test                    # or, by hand:
 cd backend && source .venv/bin/activate
-pytest                       # 93 tests: scanner, memory, verification, agents, orchestration,
-                             # CLI, solve harness, API
+pytest                       # 97 tests: scanner, memory, verification, agents, orchestration,
+                             # CLI, fixing, solve harness, API
 pytest tests/test_api.py -k stale -v
 pytest tests/test_solve.py -q   # the harness: test runner, Solver, gate, solve CLI
 ```

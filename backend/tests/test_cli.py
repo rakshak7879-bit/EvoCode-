@@ -13,7 +13,7 @@ import pytest
 
 from config import Settings
 from evo_cli.console import Console
-from evo_cli.main import main
+from evo_cli.main import EXIT_OK, main
 from evo_cli.repository import prepare_repository, run_analysis
 from evo_cli.session import parse_location
 from services import build_services
@@ -229,3 +229,32 @@ def test_shell_accepts_fix_and_guides_one_shot_commands(cli: Invoke, monkeypatch
     assert "Proposed fixes" in out and "Hardcoded API key" in out
     assert "Applied" in out and "isolated working copy" in out
     assert code == 1, "the rejected `solve` command makes the scripted session exit non-zero"
+
+
+def test_fix_accepts_a_goal_with_or_without_a_repository(cli: Invoke) -> None:
+    repo_id = demo_id(cli)
+    # Goal only: the first word must not be mistaken for a repository id.
+    code, out, err = cli("fix", "the hardcoded secrets", "--dry-run")
+    assert code == EXIT_OK, err
+    assert "scope: hardcoded-secret/known-key-format" in out and "Hardcoded API key" in out
+    # Repository and goal together, and the unambiguous --goal form.
+    code, out, err = cli("fix", repo_id, "xss", "--dry-run")
+    assert code == EXIT_OK and "scope: dom-xss" in out, err
+    code, out, err = cli("fix", "--goal", "the CORS policy", "--dry-run")
+    assert code == EXIT_OK and "scope: insecure-cors" in out, err
+    # Something that clearly means a repository still fails loudly.
+    code, _, err = cli("fix", "deadbeef", "--dry-run")
+    assert code == 1 and "No analysis found for 'deadbeef'" in err
+
+
+def test_fix_verifies_patches_and_records_them_resolved(cli: Invoke) -> None:
+    repo_id = demo_id(cli)
+    code, out, err = cli("--json", "fix", repo_id, "--goal", "the hardcoded secrets", "--yes")
+    assert code == EXIT_OK, err
+    payload = json.loads(out.split("\n{", 1)[-1] if out.strip().startswith("{") else out[out.index("{"):])
+    assert len(payload["applied"]) == 2 and payload["files"] == ["backend/auth.js", "backend/payments.js"]
+    assert Path(payload["patch_path"]).is_file()
+
+    after = json.loads(cli("--json", "findings", repo_id)[1])
+    assert all(finding["title"] not in {"Hardcoded API key", "Hardcoded JWT secret"} for finding in after)
+    assert all(finding["status"] == "verified" for finding in after), "the rest stays verified"
