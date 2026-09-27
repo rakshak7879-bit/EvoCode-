@@ -1,10 +1,32 @@
 # Agents
 
 ```text
-Agent → Brain → Verification
+L2 sub-agent → L1 lead agent → L0 Brain → Verification
 ```
 
 Agents produce **claims**. Only the Brain turns claims into findings, and only after cross-validation and source verification.
+
+Orchestration has three levels. The Brain (L0) routes work to lead agents (L1); each lead delegates
+to its own team of specialist sub-agents (L2). A sub-agent never touches the database, the
+filesystem or another sub-agent: it receives a read-only context plus the outputs of the members it
+declared as dependencies, and returns a `SubAgentOutput`. The runtime is `agents/team.py`.
+
+| Lead agent (L1) | Sub-agents (L2) | When it runs |
+| --- | --- | --- |
+| 🛡 Security | Secrets Scanner · Injection Analyst · Auth & Crypto Auditor · Config & Exposure Auditor · Prompt-Injection Sentinel · *LLM Security Reviewer* | every analysis |
+| ♻ Duplicate Code | Function Extractor · Identical-File Detector · Clone Detector · Reuse Advisor · *LLM Clone Explainer* | every analysis |
+| 🧭 Explainer | Stack Detector · Module Mapper · Route Mapper · History Analyst · Flow Tracer · Summary Writer · *LLM Summarizer* | every analysis |
+| 🎬 Walkthrough | Storyline Planner · Timing Planner · *LLM Narrator* | every analysis |
+| 🔧 Fixer | Fix Planner · Patch Writer · *LLM Patch Writer* · Safety Reviewer · Fix Verifier | `./evo fix` |
+| 🧩 Solver | Issue Analyst · Code Locator · Test Scout · Reproducer · Plan Writer · *LLM Solution Reviewer* | `./evo solve` |
+
+*Italic* members only run when an API key is configured; otherwise they are skipped and labeled, and
+the lead reports what it fell back to. 27 sub-agents in total, 21 of them in the analysis agents.
+
+Members run in dependency waves: everything whose dependencies are satisfied runs concurrently.
+`depends_on` is a hard dependency (the member is skipped if it cannot be satisfied), `uses` is a soft
+one (a failure upstream is tolerated). A member failing never fails its lead, and a lead failing
+never fails the analysis. `./evo tree` shows the resulting hierarchy for any analysis.
 
 ## Brain responsibilities
 
@@ -13,7 +35,8 @@ Agents produce **claims**. Only the Brain turns claims into findings, and only a
 | Understand task | Keyword intents → agent plan with human-readable reasons; adds dependencies | `orchestrator/router.py` |
 | Load context | Reads indexed files from the working copy, parses them, recalls previous insights | `orchestrator/context_builder.py` |
 | Retrieve memory | Runs FTS5 searches per domain (security, duplicate, explainer focus) | `ContextBuilder.build` |
-| Route + execute | Wave 1 in parallel, wave 2 with upstream results; timeouts; failure isolation | `Brain._execute`, `Brain._run_agent` |
+| Route + execute | Wave 1 in parallel, wave 2 with upstream results; timeouts; failure isolation; supplies each lead's delegation runtime | `Brain._execute`, `Brain._run_agent` |
+| Record the hierarchy | The full L0 → L1 → L2 tree with per-member status, wave and timing | `Brain._orchestration`, `orchestrator/progress.py` |
 | Aggregate | Collects `FindingDraft`s from completed agents | `Brain.analyze` |
 | Cross-validate | Anchors claims, rejects unsupported ones, merges, resolves conflicts, annotates | `orchestrator/crossval.py` |
 | Verify | SHA-256 anchors for findings, locations and citations | `orchestrator/evidence.py`, `verification/citations.py` |
@@ -29,9 +52,31 @@ class BaseAgent(ABC):
     description: ClassVar[str]
     requires: ClassVar[tuple[str, ...]] = ()   # upstream results the Brain must pass in
     consumes: ClassVar[tuple[str, ...]] = ()   # optional upstream results
+    team: ClassVar[tuple[SubAgentSpec, ...]] = ()   # the level-2 specialists it delegates to
 
     @abstractmethod
     async def run(self, context: AgentContext) -> AgentResult: ...
+```
+
+A lead delegates by planning and running its team:
+
+```python
+team = await run_team(self.name, plan_team(self.team, handlers, context), context)
+suspects = team.value("locator", [])        # a member's output, or a default if it did not run
+notes = team.failure_notes()                # human-readable degradation notes
+```
+
+```python
+@dataclass(frozen=True)
+class SubAgentSpec:
+    key: str                     # "secrets" → run name "security.secrets"
+    title: str                   # "Secrets Scanner"
+    description: str
+    depends_on: tuple[str, ...] = ()   # hard: skipped if unavailable
+    uses: tuple[str, ...] = ()         # soft: waited for, failure tolerated
+    requires_llm: bool = False         # skipped (and labeled) in local mode
+    keywords: tuple[str, ...] = ()     # selects this member for a focused task
+    fallback: str = ""                 # what the lead does without it
 ```
 
 ```python

@@ -1,0 +1,13 @@
+#!/bin/sh
+# Evo Code terminal launcher. Run `./evo --help` for commands.
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHON="$ROOT/backend/.venv/bin/python"
+
+if [ ! -x "$PYTHON" ]; then
+  echo "Evo Code is not installed yet." >&2
+  echo "Run: cd \"$ROOT/backend\" && python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt" >&2
+  exit 1
+fi
+
+exec "$PYTHON" "$ROOT/backend/cli.py" "$@"

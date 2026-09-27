@@ -270,12 +270,15 @@ class MemoryStore:
 
     # ------------------------------------------------------------------ agent runs
     def create_agent_run(
-        self, repo_id: str, analysis_no: int, agent: str, status: str, reason: str | None = None
+        self, repo_id: str, analysis_no: int, agent: str, status: str, reason: str | None = None,
+        *, result: dict[str, Any] | None = None,
     ) -> int:
+        """Create an agent run row. Lead agents use their name; sub-agents use ``<lead>.<member>``."""
         with self.db.connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO agent_runs (repository_id, analysis_no, agent, status, reason) VALUES (?, ?, ?, ?, ?)",
-                (repo_id, analysis_no, agent, status, reason),
+                """INSERT INTO agent_runs (repository_id, analysis_no, agent, status, reason, result)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (repo_id, analysis_no, agent, status, reason, json.dumps(result or {})),
             )
         return int(cursor.lastrowid or 0)
 

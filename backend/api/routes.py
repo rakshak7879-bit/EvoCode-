@@ -165,6 +165,16 @@ def repository_status(repository_id: RepositoryId, services: ServicesDep) -> dic
     repo = require_repository(services, repository_id)
     runs = services.store.list_agent_runs(repository_id, repo["analysis_count"])
     latest = {run["agent"]: run for run in runs}
+    members: dict[str, list[dict[str, Any]]] = {}
+    for run in runs:
+        parent, _, key = run["agent"].partition(".")
+        if key:
+            record = run["result"] or {}
+            members.setdefault(parent, []).append({
+                "name": run["agent"], "key": key, "title": record.get("title") or key, "status": run["status"],
+                "wave": record.get("wave") or 0, "mode": run["mode"], "summary": run["summary"],
+                "reason": run["reason"], "error": run["error"], "duration_ms": run["duration_ms"],
+            })
     agents = []
     for name, agent in services.brain.agents.items():
         run = latest.get(name)
@@ -175,6 +185,7 @@ def repository_status(repository_id: RepositoryId, services: ServicesDep) -> dic
             "reason": run["reason"] if run else None, "error": run["error"] if run else None,
             "duration_ms": run["duration_ms"] if run else None,
             "started_at": run["started_at"] if run else None, "completed_at": run["completed_at"] if run else None,
+            "subagents": members.get(name, []),
         })
     findings = services.store.list_findings(repository_id)
     memory_entries = sum(services.store.memory_counts(repository_id).values())

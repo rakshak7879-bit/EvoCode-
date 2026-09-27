@@ -11,20 +11,24 @@ Method (deterministic):
    canonical copy, so the recommendation can point at code that already exists.
 
 With an LLM configured, cluster explanations are optionally enriched.
+
+The Duplicate Code Agent is a lead agent (level 1) that delegates these steps
+to level-2 specialists: Function Extractor and Identical-File Detector run in
+parallel, then the Clone Detector, then the Reuse Advisor (canonical copy and
+recommendations), then the optional LLM Clone Explainer.
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import PurePosixPath
 
-from agents.base import AgentResult, BaseAgent, FindingDraft, Location
+from agents.base import AgentResult, BaseAgent, FindingDraft, Location, SubAgentSpec
 from agents.context import AgentContext, SourceFile
+from agents.team import NO_LLM, Handler, SubAgentOutput, Upstream, plan_team, run_team
 from llm.prompts import redact_secrets, wrap_repository_content
-from llm.provider import LLMError
 from memory.tokens import split_identifier
 from repo.parser import Symbol
 
@@ -216,28 +220,60 @@ def choose_canonical(cluster: Cluster) -> FunctionSample | None:
     return shared[0]
 
 
+def identical_file_groups(context: AgentContext) -> list[list[SourceFile]]:
+    groups: dict[str, list[SourceFile]] = {}
+    for file in context.source_files:
+        if file.size >= 200 and "test" not in file.tags:
+            groups.setdefault(file.sha256, []).append(file)
+    return [group for group in groups.values() if len(group) > 1]
+
+
+#: Level-2 team: extraction and identical-file detection run in parallel (wave 1).
+DUPLICATE_TEAM: tuple[SubAgentSpec, ...] = (
+    SubAgentSpec("functions", "Function Extractor",
+                 "Extracts functions and normalizes their tokens (identifiers, strings and numbers)"),
+    SubAgentSpec("files", "Identical-File Detector", "Groups byte-for-byte identical source files by SHA-256"),
+    SubAgentSpec("clones", "Clone Detector",
+                 "Compares 5-token shingles with Jaccard similarity and clusters near-identical functions",
+                 depends_on=("functions",)),
+    SubAgentSpec("reuse", "Reuse Advisor",
+                 "Finds the shared implementation that already exists and writes the refactoring advice",
+                 uses=("clones", "files")),
+    SubAgentSpec("llm_explain", "LLM Clone Explainer", "Adds a semantic explanation to each clone cluster",
+                 depends_on=("reuse",), uses=("clones",), requires_llm=True,
+                 fallback="explanations are template-based"),
+)
+
+
 class DuplicateAgent(BaseAgent):
     name = "duplicate"
     title = "Duplicate Code Agent"
     description = "Finds duplicated functions, repeated validation and copy-pasted helpers; points to existing shared code."
+    team = DUPLICATE_TEAM
 
     async def run(self, context: AgentContext) -> AgentResult:
-        samples = await asyncio.to_thread(collect_samples, context)
-        clusters = await asyncio.to_thread(find_clusters, samples)
-        cluster_payloads = [self._cluster_payload(index, cluster) for index, cluster in enumerate(clusters, start=1)]
-        cluster_payloads.extend(self._identical_files(context, start=len(cluster_payloads) + 1))
+        handlers: dict[str, Handler] = {
+            "functions": self._extract,
+            "files": self._identical,
+            "clones": self._detect,
+            "reuse": self._advise,
+            "llm_explain": self._explain,
+        }
+        team = await run_team(self.name, plan_team(self.team, handlers, context), context)
+        if not (team.completed("clones") or team.completed("files")) or not team.completed("reuse"):
+            raise RuntimeError("Duplicate detection did not complete: " + "; ".join(team.failure_notes()))
 
+        samples: list[FunctionSample] = team.value("functions", [])
+        cluster_payloads: list[dict] = team.value("reuse", [])
         notes: list[str] = []
         mode = "local"
-        if context.llm.available and cluster_payloads:
-            try:
-                await self._llm_enrich(context, cluster_payloads, clusters)
-                mode = "llm"
-                notes.append("LLM added semantic explanations; similarity scores remain deterministic.")
-            except LLMError as exc:
-                notes.append(f"LLM enrichment unavailable ({exc}); explanations are template-based.")
-        else:
+        explainer = team.output("llm_explain")
+        if explainer is not None and explainer.mode == "llm":
+            mode = "llm"
+            notes.append("LLM added semantic explanations; similarity scores remain deterministic.")
+        elif explainer is None and (run := team.run("llm_explain")) is not None and run.reason == NO_LLM:
             notes.append("Structural token similarity (local analysis); explanations are template-based.")
+        notes.extend(team.failure_notes())
 
         findings = [self._finding(payload) for payload in cluster_payloads]
         pairs = [pair for payload in cluster_payloads for pair in payload.pop("_pairs", [])]
@@ -254,7 +290,55 @@ class DuplicateAgent(BaseAgent):
             },
             notes=notes,
             metrics={"clusters": len(cluster_payloads), "functions_compared": len(samples)},
+            subagents=team.runs,
         )
+
+    # ------------------------------------------------------------------ team members
+    @staticmethod
+    def _extract(context: AgentContext, upstream: Upstream) -> SubAgentOutput:
+        samples = collect_samples(context)
+        files = len({sample.symbol.file for sample in samples})
+        return SubAgentOutput(summary=f"{len(samples)} function(s) normalized from {files} file(s)", value=samples,
+                              metrics={"functions": len(samples), "files": files})
+
+    @staticmethod
+    def _identical(context: AgentContext, upstream: Upstream) -> SubAgentOutput:
+        groups = identical_file_groups(context)
+        return SubAgentOutput(summary=f"{len(groups)} identical file group(s)", value=groups,
+                              metrics={"groups": len(groups)})
+
+    @staticmethod
+    def _detect(context: AgentContext, upstream: Upstream) -> SubAgentOutput:
+        samples: list[FunctionSample] = upstream["functions"].value
+        clusters = find_clusters(samples)
+        comparisons = len(samples) * (len(samples) - 1) // 2
+        return SubAgentOutput(
+            summary=f"{len(clusters)} clone cluster(s) at ≥{round(SIMILARITY_THRESHOLD * 100)}% similarity "
+                    f"({comparisons} pair(s) compared)",
+            value=clusters,
+            metrics={"clusters": len(clusters), "comparisons": comparisons},
+        )
+
+    def _advise(self, context: AgentContext, upstream: Upstream) -> SubAgentOutput:
+        clusters: list[Cluster] = upstream["clones"].value if "clones" in upstream else []
+        groups: list[list[SourceFile]] = upstream["files"].value if "files" in upstream else []
+        payloads = [self._cluster_payload(index, cluster) for index, cluster in enumerate(clusters, start=1)]
+        payloads.extend(self._identical_payloads(groups, start=len(payloads) + 1))
+        reuse = sum(1 for payload in payloads if payload["canonical"])
+        return SubAgentOutput(
+            summary=f"{len(payloads)} cluster(s) · {reuse} point at an existing shared implementation",
+            value=payloads,
+            metrics={"clusters": len(payloads), "reuse_existing": reuse},
+        )
+
+    async def _explain(self, context: AgentContext, upstream: Upstream) -> SubAgentOutput:
+        payloads: list[dict] = upstream["reuse"].value
+        clusters: list[Cluster] = upstream["clones"].value if "clones" in upstream else []
+        if not payloads:
+            return SubAgentOutput(summary="No clusters to explain")
+        enriched = await self._llm_enrich(context, payloads, clusters)
+        return SubAgentOutput(summary=f"{enriched} cluster explanation(s) enriched", mode="llm",
+                              metrics={"enriched": enriched})
 
     # ------------------------------------------------------------------ helpers
     def _cluster_payload(self, index: int, cluster: Cluster) -> dict:
@@ -336,13 +420,10 @@ class DuplicateAgent(BaseAgent):
                 return score
         return jaccard(a.shingles, b.shingles)
 
-    def _identical_files(self, context: AgentContext, start: int) -> list[dict]:
-        groups: dict[str, list[SourceFile]] = {}
-        for file in context.source_files:
-            if file.size >= 200 and "test" not in file.tags:
-                groups.setdefault(file.sha256, []).append(file)
+    @staticmethod
+    def _identical_payloads(groups: list[list[SourceFile]], start: int) -> list[dict]:
         payloads = []
-        for offset, files in enumerate(g for g in groups.values() if len(g) > 1):
+        for offset, files in enumerate(groups):
             members = [
                 {"file": f.path, "line_start": 1, "line_end": max(1, len(f.lines)), "symbol": None,
                  "role": "copy", "evidence": (f.lines[0].strip() if f.lines else "")[:200]}
@@ -393,14 +474,14 @@ class DuplicateAgent(BaseAgent):
             detectors=["token-shingles"],
         )
 
-    async def _llm_enrich(self, context: AgentContext, payloads: list[dict], clusters: list[Cluster]) -> None:
+    async def _llm_enrich(self, context: AgentContext, payloads: list[dict], clusters: list[Cluster]) -> int:
         blocks = []
         for payload, cluster in zip(payloads, clusters):
             for member in cluster.members[:3]:
                 body = "\n".join(member.file.lines[member.symbol.line_start - 1 : member.symbol.line_start + 39])
                 blocks.append((f"{payload['id']} · {member.symbol.file}:{member.symbol.line_start}", redact_secrets(body)))
         if not blocks:
-            return
+            return 0
         system = (
             'For each duplicate cluster id, explain in one sentence what the functions do and why they are '
             'duplicates, and give a one-sentence refactoring recommendation. Return JSON: {"clusters": '
@@ -408,6 +489,7 @@ class DuplicateAgent(BaseAgent):
         )
         result = await context.llm.complete_json(system=system, prompt=wrap_repository_content(blocks), max_tokens=900)
         by_id = {p["id"]: p for p in payloads}
+        enriched = 0
         for item in result.get("clusters") or []:
             if not isinstance(item, dict):
                 continue
@@ -416,3 +498,5 @@ class DuplicateAgent(BaseAgent):
             if target and reason:
                 target["reason"] = f"{reason[:400]} (Structural similarity {round(target['similarity'] * 100)}%.)"
                 target["explanation_source"] = "llm"
+                enriched += 1
+        return enriched

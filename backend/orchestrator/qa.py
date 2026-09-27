@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,19 @@ QA_SYSTEM = (
     "paths and line numbers. If the sources do not answer the question, say so plainly. "
     'Return JSON: {"answer": str, "citations": [int]}'
 )
+
+
+def _trace_step(agent: str, title: str, started: float, detail: str, *, parallel: bool = False,
+                mode: str = "local", duration_ms: int | None = None) -> dict[str, Any]:
+    return {
+        "agent": agent,
+        "title": title,
+        "status": "complete",
+        "detail": detail,
+        "mode": mode,
+        "parallel": parallel,
+        "duration_ms": duration_ms if duration_ms is not None else int((time.monotonic() - started) * 1000),
+    }
 
 
 def _first_sentence(text: str, limit: int = 220) -> str:
@@ -248,19 +262,47 @@ class QuestionAnswerer:
         return citation
 
     async def answer(self, repo_id: str, question: str, limit: int = 6) -> dict[str, Any]:
+        """Brain-orchestrated answer: Intent Classifier → Memory Retriever ∥ Insight Recall →
+        Citation Verifier → Answer Composer. Each step is recorded in ``trace``."""
         repo = self.store.get_repository(repo_id)
         if repo is None:
             raise KeyError(repo_id)
+        trace: list[dict[str, Any]] = []
+        started = time.monotonic()
         intent = self.router.classify_question(question)
-        plan, code_hits = await asyncio.to_thread(self.search.search, repo_id, question, limit=limit,
-                                                  memory_types=CODE_TYPES)
-        _, insight_hits = await asyncio.to_thread(self.search.search, repo_id, question, limit=4,
-                                                  memory_types=INSIGHT_TYPES, per_file=2)
+        trace.append(_trace_step("intent", "Intent Classifier", started, f"intent: {intent}"))
+
+        async def timed_search(**kwargs: Any) -> tuple[tuple[QueryPlan, list[SearchHit]], float, int]:
+            begun = time.monotonic()
+            found = await asyncio.to_thread(self.search.search, repo_id, question, **kwargs)
+            return found, begun, int((time.monotonic() - begun) * 1000)
+
+        # Code retrieval and insight recall are independent: the Brain runs them in parallel.
+        (code_result, code_started, code_ms), (insight_result, insight_started, insight_ms) = await asyncio.gather(
+            timed_search(limit=limit, memory_types=CODE_TYPES),
+            timed_search(limit=4, memory_types=INSIGHT_TYPES, per_file=2),
+        )
+        plan, code_hits = code_result
+        _, insight_hits = insight_result
+        engine = "FTS5" if self.store.db.fts5_enabled else "LIKE fallback"
+        trace.append(_trace_step("retriever", "Memory Retriever", code_started,
+                                 f"{len(code_hits)} code/doc passage(s) via {engine}", parallel=True,
+                                 duration_ms=code_ms))
+        trace.append(_trace_step("recall", "Insight Recall", insight_started,
+                                 f"{len(insight_hits)} finding/insight/history memories", parallel=True,
+                                 duration_ms=insight_ms))
+
+        step_started = time.monotonic()
         verifier = SourceVerifier(Path(repo["path"]))
         indexed = {f.path: f.sha256 for f in self.store.list_files(repo_id)}
         citations = [self._citation(hit, verifier, indexed) for hit in code_hits]
         related = [self._citation(hit, verifier, indexed) for hit in insight_hits]
+        checked = [c for c in citations if c["verification"]["status"] != "derived"]
+        verified = sum(1 for c in checked if c["verification"]["status"] == VerificationStatus.VERIFIED)
+        trace.append(_trace_step("verifier", "Citation Verifier", step_started,
+                                 f"{verified}/{len(checked)} cited source(s) verified (SHA-256)"))
 
+        step_started = time.monotonic()
         mode = "local"
         notes: list[str] = []
         answer: str | None = None
@@ -276,8 +318,9 @@ class QuestionAnswerer:
         if answer is None:
             findings = self.store.list_findings(repo_id) if intent in {"security", "duplicate"} else []
             answer = compose_local_answer(plan, intent, code_hits, insight_hits, findings)
-        checked = [c for c in citations if c["verification"]["status"] != "derived"]
-        verified = sum(1 for c in checked if c["verification"]["status"] == VerificationStatus.VERIFIED)
+        trace.append(_trace_step("composer", "Answer Composer", step_started,
+                                 "LLM answer restricted to retrieved sources" if mode == "llm"
+                                 else "extractive answer from verified memory (local)", mode=mode))
         return {
             "repository_id": repo_id,
             "query": question,
@@ -290,6 +333,7 @@ class QuestionAnswerer:
             "verification": {"verified": verified, "total": len(checked)},
             "notes": notes,
             "llm": self.llm.describe(),
+            "trace": trace,
         }
 
     async def _llm_answer(self, question: str, hits: list[SearchHit]) -> tuple[str, list[int]]:

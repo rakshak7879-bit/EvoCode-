@@ -98,6 +98,15 @@ def build_records(repo_id: str, accepted: list[AcceptedFinding], indexed: dict[s
     return records
 
 
+SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+
+def sort_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The one finding order used everywhere a finding is referred to by number (``show 3``, ``fix 3``)."""
+    findings.sort(key=lambda f: (SEVERITY_RANK.get(f["severity"], 9), f["category"], f["file"], f["line"]))
+    return findings
+
+
 def reverify_findings(store: MemoryStore, repo_id: str, root: Path) -> list[dict[str, Any]]:
     """Re-check every stored finding against the current working copy and persist the result."""
     findings = store.list_findings(repo_id)

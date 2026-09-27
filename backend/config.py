@@ -84,7 +84,12 @@ class Settings:
     openai_api_key: str = field(default="", repr=False)
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str = "https://api.openai.com/v1"
+    deepseek_api_key: str = field(default="", repr=False)
+    deepseek_model: str = "deepseek-chat"
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
     llm_timeout_seconds: float = 45.0
+    test_timeout_seconds: float = 300.0
+    allow_test_execution: bool = True
     max_upload_mb: int = 50
     max_extracted_mb: int = 200
     max_file_kb: int = 512
@@ -137,7 +142,12 @@ def load_settings() -> Settings:
         openai_api_key=_env_str("OPENAI_API_KEY"),
         openai_model=_env_str("OPENAI_MODEL", "gpt-4o-mini"),
         openai_base_url=_env_str("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
+        deepseek_api_key=_env_str("DEEPSEEK_API_KEY"),
+        deepseek_model=_env_str("DEEPSEEK_MODEL", "deepseek-chat"),
+        deepseek_base_url=_env_str("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/"),
         llm_timeout_seconds=_env_float("EVO_LLM_TIMEOUT_SECONDS", 45.0, 1.0),
+        test_timeout_seconds=_env_float("EVO_TEST_TIMEOUT_SECONDS", 300.0, 5.0),
+        allow_test_execution=_env_bool("EVO_ALLOW_TEST_EXECUTION", True),
         max_upload_mb=_env_int("EVO_MAX_UPLOAD_MB", 50, 1),
         max_extracted_mb=_env_int("EVO_MAX_EXTRACTED_MB", 200, 1),
         max_file_kb=_env_int("EVO_MAX_FILE_KB", 512, 1),

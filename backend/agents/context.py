@@ -8,6 +8,7 @@ from functools import cached_property
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Protocol
 
+from agents.team import DelegationRuntime
 from repo.parser import ParsedFile, Symbol
 
 if TYPE_CHECKING:
@@ -55,6 +56,8 @@ class AgentContext:
     focus: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     upstream: Mapping[str, "AgentResult"] = field(default_factory=dict)
     prior_insights: tuple[str, ...] = ()
+    #: Level-2 delegation settings and progress observer supplied by the Brain.
+    delegation: DelegationRuntime = field(default_factory=DelegationRuntime)
 
     @cached_property
     def by_path(self) -> dict[str, SourceFile]:
@@ -90,3 +93,6 @@ class AgentContext:
 
     def with_upstream(self, upstream: Mapping[str, "AgentResult"]) -> "AgentContext":
         return replace(self, upstream=dict(upstream))
+
+    def with_delegation(self, delegation: DelegationRuntime) -> "AgentContext":
+        return replace(self, delegation=delegation)

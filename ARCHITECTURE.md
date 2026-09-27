@@ -1,12 +1,23 @@
 # Architecture
 
-Evo Code is a local, two-process application: a React SPA and a FastAPI backend that owns a SQLite memory store and the analysis pipeline. There are no other services.
+Evo Code is command-line first: `./evo` runs the scanner, SQLite memory store, Brain and agents in a
+single local process, with no server, browser or external service. The same engine also backs an
+optional two-process setup (a FastAPI backend plus a React SPA) for the dashboard.
+
+Orchestration has three levels: the **Brain** (L0) understands the task and routes it; **lead
+agents** (L1) own a domain; **specialist sub-agents** (L2) do the narrow work, in dependency waves.
+Two lead agents run on demand rather than during analysis: the **Fixer** (`./evo fix`) turns verified
+findings into reviewed patches, and the **Solver** (`./evo solve`) breaks an issue down, locates the
+code and runs the repository's tests so a fix can be proven. See [AGENTS.md](AGENTS.md) and
+[HARNESS.md](HARNESS.md).
 
 ## System architecture
 
 ```mermaid
 flowchart TD
-    User --> Frontend[React + Vite SPA]
+    Terminal["./evo CLI (primary)"] --> Pipeline
+    Model[Coding model e.g. DeepSeek] -- solve · test · check --> Terminal
+    User --> Frontend[React + Vite SPA optional]
     Frontend -- REST/JSON, polled status --> API[FastAPI]
     API --> Pipeline[Analysis pipeline<br/>background task]
     Pipeline --> Scanner[Repository scanner]
@@ -41,8 +52,9 @@ flowchart TD
 | Package | Responsibility |
 | --- | --- |
 | `api/` | Routes, Pydantic schemas, source viewer endpoints, dependency helpers |
-| `orchestrator/` | `brain.py` (orchestration), `router.py` (task → agents), `context_builder.py`, `crossval.py`, `evidence.py` (records + live re-verification), `qa.py`, `pipeline.py`, `progress.py` |
-| `agents/` | `base.py` contract, `security.py` + `security_rules.py`, `duplicate.py`, `explainer.py` + `architecture.py`/`flows.py`/`history.py`, `walkthrough.py` |
+| `evo_cli/` | `main.py` (commands), `console.py`, `orchestration.py` (live stream + agent tree), `views.py`, `solve_views.py`, `session.py` (interactive shell) |
+| `orchestrator/` | `brain.py` (orchestration), `router.py` (task → agents), `context_builder.py`, `crossval.py`, `evidence.py` (records + live re-verification), `qa.py`, `pipeline.py`, `progress.py`, `fixing.py` (fix plans + apply), `solving.py` (solve sessions + the gate) |
+| `agents/` | `base.py` contract, `team.py` (level-2 delegation runtime), `security.py` + `security_rules.py`, `duplicate.py`, `explainer.py` + `architecture.py`/`flows.py`/`history.py`, `walkthrough.py`, `fixer.py` + `fix_strategies.py`, `solver.py` |
 | `memory/` | `database.py` (schema, WAL, corruption recovery), `store.py` (data access), `indexer.py`, `search.py`, `tokens.py` |
 | `repo/` | `scanner.py`, `parser.py` (regex/brace-matching parser), `archive.py` (safe ZIP), `github.py`, `paths.py`, `filters.py`, `text.py` |
 | `verification/` | `citations.py`: anchor (analysis time) and verify (any time) |

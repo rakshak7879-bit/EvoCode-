@@ -91,7 +91,7 @@ class AnalysisPipeline:
 
             report = await self.brain.analyze(repo_id, progress)
             self.store.update_repository(repo_id, status="completed", stage="completed", brain_state="complete",
-                                         brain_message="Verified intelligence ready", report=report)
+                                         brain_message="Verified intelligence ready", report=report, error=None)
             progress.log("Analysis complete: verified intelligence ready", level="success", stage="completed")
         except Exception as exc:
             expected = isinstance(exc, (AnalysisError, ArchiveError, GitHubError))

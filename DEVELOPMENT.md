@@ -50,8 +50,11 @@ cp .env.example .env
 | `OPENAI_API_KEY` | empty | Empty = deterministic local analysis (UI shows **DEMO / LOCAL ANALYSIS**) |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Any chat model that supports JSON mode |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible servers work too |
-| `EVO_LLM_PROVIDER` | `auto` | `mock` forces local mode even with a key |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` | empty / `deepseek-chat` | DeepSeek via its OpenAI-compatible API; `deepseek-reasoner` also works |
+| `EVO_LLM_PROVIDER` | `auto` | `auto` prefers DeepSeek, then OpenAI; `mock` forces local mode even with a key |
 | `EVO_LLM_TIMEOUT_SECONDS` | `45` | Per LLM request |
+| `EVO_ALLOW_TEST_EXECUTION` | `true` | Whether `solve`/`check` may run the target repository's tests |
+| `EVO_TEST_TIMEOUT_SECONDS` | `300` | Wall clock per test run before the process group is killed |
 | `EVO_DATA_DIR` | `.evo-data` | Relative paths resolve from the project root |
 | `EVO_MAX_UPLOAD_MB` | `50` | |
 | `EVO_MAX_EXTRACTED_MB` | `200` | |
@@ -70,9 +73,14 @@ cp .env.example .env
 
 ```bash
 cd backend && source .venv/bin/activate
-pytest                       # 61 tests: scanner, memory, verification, agents, API
+pytest                       # 93 tests: scanner, memory, verification, agents, orchestration,
+                             # CLI, solve harness, API
 pytest tests/test_api.py -k stale -v
+pytest tests/test_solve.py -q   # the harness: test runner, Solver, gate, solve CLI
 ```
+
+`tests/test_solve.py` builds a tiny repository with a real pytest suite and one failing test, then
+drives the whole harness against it, so the gate is exercised end to end.
 
 Tests use a temporary data directory, `EVO_LLM_PROVIDER=mock` behavior and zero pacing; a `FakeLLM` covers LLM-mode validation (hallucinated claims rejected, secrets redacted from prompts, LLM failures falling back to local mode).
 
@@ -81,7 +89,12 @@ Frontend: `npm run build` runs `tsc -b` (strict) and the production build; `npm 
 ## Useful commands
 
 ```bash
-# Analyze the demo repo from the CLI
+# Everything from the terminal, no server needed
+./evo demo                      # analyze the bundled repo, then open the shell
+./evo tree                      # the L0 → L1 → L2 agent hierarchy
+./evo fix --dry-run             # proposed patches for the findings
+./evo solve --issue "..."       # break an issue down and capture a failing baseline
+# Analyze the demo repo through the HTTP API instead
 curl -F use_demo=true http://127.0.0.1:8000/api/repository/analyze
 # Instant analyses while developing
 EVO_PACING_MS=0 uvicorn main:app --reload

@@ -4,6 +4,9 @@ Answers: "If I had 2 minutes to explain this repository to a judge, what
 would I show?" It consumes the Explainer, Security and Duplicate results that
 the Brain passes in (agents never talk to each other directly). Every step
 cites source lines, which the Brain verifies.
+
+The Walkthrough Agent is a lead agent (level 1) with a three-member level-2
+pipeline: Storyline Planner → Timing Planner → LLM Narrator (optional).
 """
 
 from __future__ import annotations
@@ -11,9 +14,9 @@ from __future__ import annotations
 from typing import Any
 
 from agents.architecture import AUTH_NAME
-from agents.base import SEVERITY_ORDER, AgentResult, BaseAgent, FindingDraft
+from agents.base import SEVERITY_ORDER, AgentResult, BaseAgent, FindingDraft, SubAgentSpec
 from agents.context import AgentContext
-from llm.provider import LLMError
+from agents.team import NO_LLM, Handler, SubAgentOutput, Upstream, plan_team, run_team
 
 TARGET_SECONDS = 120
 BASE_DURATIONS = {
@@ -41,6 +44,23 @@ def _scale_durations(steps: list[dict[str, Any]]) -> None:
 
 def build_steps(context: AgentContext, explainer: dict[str, Any], security: list[FindingDraft],
                 duplicates: dict[str, Any]) -> list[dict[str, Any]]:
+    """Storyline plus timing in one call (what the Storyline and Timing planners do together)."""
+    steps = plan_storyline(context, explainer, security, duplicates)
+    schedule_steps(steps)
+    return steps
+
+
+def schedule_steps(steps: list[dict[str, Any]]) -> None:
+    """Number the steps and fit their durations into the two-minute target."""
+    for index, step in enumerate(steps, start=1):
+        step["index"] = index
+        step["duration"] = BASE_DURATIONS.get(step["key"], 10)
+    _scale_durations(steps)
+
+
+def plan_storyline(context: AgentContext, explainer: dict[str, Any], security: list[FindingDraft],
+                   duplicates: dict[str, Any]) -> list[dict[str, Any]]:
+    """Choose the walkthrough sections and the cited code for each (no timing)."""
     steps: list[dict[str, Any]] = []
     readme = context.readme
     stack = explainer.get("architecture", {})
@@ -157,12 +177,17 @@ def build_steps(context: AgentContext, explainer: dict[str, Any], security: list
             "talking_points": actions[:4],
             "narration": "Verified intelligence turns into a short, prioritized to-do list.",
         })
-
-    for index, step in enumerate(steps, start=1):
-        step["index"] = index
-        step["duration"] = BASE_DURATIONS.get(step["key"], 10)
-    _scale_durations(steps)
     return steps
+
+
+#: Level-2 pipeline: storyline → timing → optional LLM narration.
+WALKTHROUGH_TEAM: tuple[SubAgentSpec, ...] = (
+    SubAgentSpec("storyline", "Storyline Planner",
+                 "Chooses the sections and the cited code for each step from the upstream agents' results"),
+    SubAgentSpec("timing", "Timing Planner", "Fits the walkthrough into two minutes", depends_on=("storyline",)),
+    SubAgentSpec("narrator", "LLM Narrator", "Rewrites the narration for a live demo without inventing facts",
+                 depends_on=("timing",), requires_llm=True, fallback="using template narration"),
+)
 
 
 class WalkthroughAgent(BaseAgent):
@@ -171,28 +196,29 @@ class WalkthroughAgent(BaseAgent):
     description = "Turns the analysis into a presentation-ready two-minute walkthrough with cited code."
     requires = ("explainer",)
     consumes = ("security", "duplicate")
+    team = WALKTHROUGH_TEAM
 
     async def run(self, context: AgentContext) -> AgentResult:
-        explainer = context.upstream.get("explainer")
-        security = context.upstream.get("security")
-        duplicate = context.upstream.get("duplicate")
         notes: list[str] = []
-        explainer_data = explainer.data if explainer and explainer.status == "complete" else {}
-        if not explainer_data:
+        explainer = context.upstream.get("explainer")
+        if not (explainer and explainer.status == "complete" and explainer.data):
             notes.append("Explainer output unavailable; walkthrough built from README and findings only.")
-        security_findings = security.findings if security and security.status == "complete" else []
-        duplicate_data = duplicate.data if duplicate and duplicate.status == "complete" else {}
-        steps = build_steps(context, explainer_data, security_findings, duplicate_data)
+        handlers: dict[str, Handler] = {"storyline": self._storyline, "timing": self._timing,
+                                        "narrator": self._narrator}
+        team = await run_team(self.name, plan_team(self.team, handlers, context), context)
+        steps: list[dict[str, Any]] | None = team.value("storyline")
+        if steps is None:
+            raise RuntimeError("The Storyline Planner did not complete: " + "; ".join(team.failure_notes()))
+        if not team.completed("timing"):
+            schedule_steps(steps)  # the lead falls back to default timing
 
         mode = "local"
-        if context.llm.available and steps:
-            try:
-                await self._polish(context, steps)
-                mode = "llm"
-            except LLMError as exc:
-                notes.append(f"LLM narration unavailable ({exc}); using template narration.")
-        else:
+        narrator = team.output("narrator")
+        if narrator is not None and narrator.mode == "llm":
+            mode = "llm"
+        elif narrator is None and (run := team.run("narrator")) is not None and run.reason == NO_LLM:
             notes.append("Template narration (local analysis).")
+        notes.extend(team.failure_notes())
         total = sum(step["duration"] for step in steps)
         return AgentResult(
             agent=self.name,
@@ -206,9 +232,45 @@ class WalkthroughAgent(BaseAgent):
             },
             notes=notes,
             metrics={"steps": len(steps), "seconds": total},
+            subagents=team.runs,
         )
 
-    async def _polish(self, context: AgentContext, steps: list[dict[str, Any]]) -> None:
+    # ------------------------------------------------------------------ team members
+    @staticmethod
+    def _storyline(context: AgentContext, upstream: Upstream) -> SubAgentOutput:
+        leads = context.upstream
+        explainer, security, duplicate = leads.get("explainer"), leads.get("security"), leads.get("duplicate")
+        steps = plan_storyline(
+            context,
+            explainer.data if explainer and explainer.status == "complete" else {},
+            security.findings if security and security.status == "complete" else [],
+            duplicate.data if duplicate and duplicate.status == "complete" else {},
+        )
+        citations = sum(len(step["citations"]) for step in steps)
+        return SubAgentOutput(
+            summary=f"{len(steps)} section(s) with {citations} citation(s): "
+                    + ", ".join(step["key"] for step in steps),
+            value=steps,
+            metrics={"steps": len(steps), "citations": citations},
+        )
+
+    @staticmethod
+    def _timing(context: AgentContext, upstream: Upstream) -> SubAgentOutput:
+        steps: list[dict[str, Any]] = upstream["storyline"].value
+        schedule_steps(steps)
+        total = sum(step["duration"] for step in steps)
+        return SubAgentOutput(summary=f"{total}s total across {len(steps)} step(s) (target {TARGET_SECONDS}s)",
+                              value=steps, metrics={"seconds": total})
+
+    async def _narrator(self, context: AgentContext, upstream: Upstream) -> SubAgentOutput:
+        steps: list[dict[str, Any]] = upstream["timing"].value
+        if not steps:
+            return SubAgentOutput(summary="Nothing to narrate")
+        rewritten = await self._polish(context, steps)
+        return SubAgentOutput(summary=f"{rewritten} narration(s) rewritten for a live demo", mode="llm",
+                              metrics={"rewritten": rewritten})
+
+    async def _polish(self, context: AgentContext, steps: list[dict[str, Any]]) -> int:
         outline = [{"index": s["index"], "title": s["title"], "talking_points": s["talking_points"]} for s in steps]
         system = (
             "Rewrite the narration for each walkthrough step as one or two confident, concrete sentences for a live "
@@ -217,6 +279,9 @@ class WalkthroughAgent(BaseAgent):
         result = await context.llm.complete_json(system=system, prompt=f"Walkthrough outline (data): {outline}",
                                                  max_tokens=900)
         by_index = {s["index"]: s for s in steps}
+        rewritten = 0
         for item in result.get("steps") or []:
             if isinstance(item, dict) and item.get("index") in by_index and item.get("narration"):
                 by_index[item["index"]]["narration"] = str(item["narration"])[:400]
+                rewritten += 1
+        return rewritten

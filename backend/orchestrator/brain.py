@@ -1,10 +1,16 @@
-"""The Evo Code Brain: central orchestrator.
+"""The Evo Code Brain: central orchestrator (orchestration level 0).
 
 Steps: understand the task -> load repository context and memory -> route to
-specialist agents -> execute them (isolated, failure-tolerant) -> aggregate ->
-cross-validate -> verify against source (SHA-256) -> write verified
-intelligence back to memory. Agents never talk to each other; the Brain passes
-upstream results explicitly.
+lead agents -> execute them in dependency waves (isolated, failure-tolerant) ->
+aggregate -> cross-validate -> verify against source (SHA-256) -> write
+verified intelligence back to memory. Agents never talk to each other; the
+Brain passes upstream results explicitly.
+
+Multi-level orchestration: each lead agent (level 1) delegates to its own team
+of specialist sub-agents (level 2, see ``agents/team.py``). The Brain supplies
+the delegation runtime (progress observer, pacing, failure simulation, and
+whether a focused task allows leads to narrow their teams) and records the
+full hierarchy in ``report["orchestration"]``.
 """
 
 from __future__ import annotations
@@ -12,12 +18,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from agents.base import AgentResult, BaseAgent
 from agents.context import AgentContext
+from agents.team import DelegationRuntime
 from config import Settings
 from llm.provider import LLMProvider
 from memory.search import MemorySearch
@@ -55,6 +63,7 @@ class Brain:
             raise KeyError(repo_id)
         root = Path(repo["path"])
         task = repo.get("task") or DEFAULT_TASK
+        progress.titles.update({name: agent.title for name, agent in self.agents.items()})
 
         await progress.stage("understanding", "thinking", f'Understanding task: "{task}"')
         plan = self.router.plan(task)
@@ -73,15 +82,20 @@ class Brain:
             progress.log(f"Recalled {summary.prior_insights} insight(s) from the previous analysis")
         prior_findings = {f["fingerprint"]: f for f in self.store.list_findings(repo_id)}
 
-        await progress.stage("routing", "routing", f"Routing work to {len(plan.agents)} specialist agent(s)")
+        await progress.stage("routing", "routing", f"Routing work to {len(plan.agents)} lead agent(s)")
         for item in plan.agents:
             progress.agent_queued(item.name, item.reason)
             progress.log(f"Route → {self.agents[item.name].title}: {item.reason}", agent=item.name)
         for item in plan.skipped:
             progress.agent_skipped(item.name, item.reason)
+        roster = sum(len(self.agents[item.name].team) for item in plan.agents)
+        progress.log(
+            f"Delegation plan: Brain → {len(plan.agents)} lead agent(s) → up to {roster} specialist sub-agent(s)"
+            + ("" if plan.full_analysis else " · focused task: leads may narrow their teams")
+        )
 
-        await progress.stage("running", "running", "Specialist agents running", pace=False)
-        results = await self._execute(plan, context, progress)
+        await progress.stage("running", "running", "Lead agents delegating to specialist sub-agents", pace=False)
+        results, waves = await self._execute(plan, context, progress)
 
         await progress.stage("aggregating", "thinking", "Aggregating and normalizing agent outputs")
         completed = {name: r for name, r in results.items() if r.status == "complete"}
@@ -148,22 +162,27 @@ class Brain:
                        "duration_ms": r.duration_ms, "error": r.error}
                 for name, r in results.items()
             },
+            "orchestration": self._orchestration(plan, results, waves, progress),
         }
 
     async def answer(self, repo_id: str, question: str, limit: int = 6) -> dict[str, Any]:
         return await self.qa.answer(repo_id, question, limit)
 
     # ------------------------------------------------------------------ execution
-    async def _execute(self, plan: TaskPlan, context: AgentContext, progress: ProgressReporter) -> dict[str, AgentResult]:
+    async def _execute(self, plan: TaskPlan, context: AgentContext,
+                       progress: ProgressReporter) -> tuple[dict[str, AgentResult], dict[str, int]]:
+        """Run lead agents in dependency waves; returns results and each lead's wave number."""
         planned = [self.agents[item.name] for item in plan.agents]
         first_wave = [agent for agent in planned if not agent.requires]
         second_wave = [agent for agent in planned if agent.requires]
+        waves = {agent.name: 1 for agent in first_wave} | {agent.name: 2 for agent in second_wave}
         stagger = self.settings.pacing_ms / 1000 * 0.4
+        narrow = not plan.full_analysis
 
         async def delayed(agent: BaseAgent, delay: float) -> AgentResult:
             if delay:
                 await asyncio.sleep(delay)
-            return await self._run_agent(agent, context, progress)
+            return await self._run_agent(agent, context, progress, narrow=narrow)
 
         results: dict[str, AgentResult] = {}
         outputs = await asyncio.gather(*(delayed(agent, i * stagger) for i, agent in enumerate(first_wave)))
@@ -177,23 +196,39 @@ class Brain:
                              level="warning", agent=agent.name)
             else:
                 progress.log(f"Brain passes {', '.join(upstream)} results to the {agent.title}", agent=agent.name)
-            results[agent.name] = await self._run_agent(agent, context.with_upstream(upstream), progress)
-        return results
+            results[agent.name] = await self._run_agent(agent, context.with_upstream(upstream), progress,
+                                                        narrow=narrow)
+        return results, waves
 
-    async def _run_agent(self, agent: BaseAgent, context: AgentContext, progress: ProgressReporter) -> AgentResult:
+    def _delegation(self, progress: ProgressReporter, *, narrow: bool) -> DelegationRuntime:
+        return DelegationRuntime(
+            observer=progress,
+            allow_narrowing=narrow,
+            min_visible_ms=int(self.settings.pacing_ms * 0.5),
+            simulate_failures=frozenset(self.settings.simulate_agent_failure),
+            timeout_seconds=self.settings.agent_timeout_seconds,
+        )
+
+    async def _run_agent(self, agent: BaseAgent, context: AgentContext, progress: ProgressReporter, *,
+                         narrow: bool = False) -> AgentResult:
         progress.agent_running(agent.name)
         started = time.monotonic()
         try:
             if agent.name in self.settings.simulate_agent_failure:
                 raise RuntimeError("Simulated failure (EVO_SIMULATE_AGENT_FAILURE)")
-            raw = await asyncio.wait_for(agent.run(context), timeout=self.settings.agent_timeout_seconds)
+            delegated = context.with_delegation(self._delegation(progress, narrow=narrow))
+            raw = await asyncio.wait_for(agent.run(delegated), timeout=self.settings.agent_timeout_seconds)
             result = raw if isinstance(raw, AgentResult) else AgentResult.model_validate(raw)
         except asyncio.TimeoutError:
             result = AgentResult(agent=agent.name, status="failed",
                                  error=f"Timed out after {self.settings.agent_timeout_seconds:.0f}s")
         except Exception as exc:  # one agent failing must never break the analysis
-            logger.exception("Agent failed", extra={"agent": agent.name, "repository_id": context.repository_id})
+            if "Simulated failure" not in str(exc):
+                logger.exception("Agent failed", extra={"agent": agent.name, "repository_id": context.repository_id})
             result = AgentResult(agent=agent.name, status="failed", error=f"{exc.__class__.__name__}: {exc}")
+        if result.status == "failed":
+            progress.abandon_team(agent.name, f"Lead agent failed: {result.error}")
+            result.subagents = progress.members(agent.name)
         minimum = self.settings.pacing_ms * 2.5 / 1000
         elapsed = time.monotonic() - started
         if elapsed < minimum:
@@ -203,6 +238,47 @@ class Brain:
         progress.agent_finished(agent.name, status=result.status, mode=result.mode, summary=summary,
                                 result=result.model_dump(mode="json"), error=result.error)
         return result
+
+    def _orchestration(self, plan: TaskPlan, results: dict[str, AgentResult], waves: dict[str, int],
+                       progress: ProgressReporter) -> dict[str, Any]:
+        """The full Brain → lead agents → specialist sub-agents hierarchy of this analysis."""
+        reasons = {item.name: item.reason for item in (*plan.agents, *plan.skipped)}
+        leads: list[dict[str, Any]] = []
+        for name, agent in self.agents.items():
+            result = results.get(name)
+            members = [run.model_dump(mode="json") for run in progress.members(name)]
+            leads.append({
+                "name": name,
+                "title": agent.title,
+                "level": 1,
+                "wave": waves.get(name, 0),
+                "status": result.status if result else "skipped",
+                "reason": reasons.get(name, ""),
+                "mode": result.mode if result else None,
+                "duration_ms": result.duration_ms if result else None,
+                "summary": result.summary if result and result.status == "complete" else None,
+                "error": result.error if result else None,
+                "requires": list(agent.requires),
+                "consumes": list(agent.consumes),
+                "team_size": len(agent.team),
+                "subagents": members,
+            })
+        statuses = Counter(member["status"] for lead in leads for member in lead["subagents"])
+        return {
+            "levels": 3,
+            "brain": {"title": "Evo Brain", "task": plan.task, "intents": list(plan.intents),
+                      "full_analysis": plan.full_analysis},
+            "leads": leads,
+            "totals": {
+                "lead_agents": len(leads),
+                "leads_run": sum(1 for lead in leads if lead["status"] != "skipped"),
+                "lead_waves": max(waves.values(), default=0),
+                "subagents": sum(len(lead["subagents"]) for lead in leads),
+                "subagents_complete": statuses["complete"],
+                "subagents_failed": statuses["failed"],
+                "subagents_skipped": statuses["skipped"],
+            },
+        }
 
     # ------------------------------------------------------------------ verification helpers
     @staticmethod

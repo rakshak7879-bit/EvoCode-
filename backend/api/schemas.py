@@ -43,6 +43,21 @@ class BrainStatus(BaseModel):
     message: str | None
 
 
+class SubAgentStatus(BaseModel):
+    """A level-2 specialist sub-agent run inside a lead agent's team."""
+
+    name: str
+    key: str
+    title: str
+    status: str
+    wave: int = 0
+    mode: str | None = None
+    summary: str | None = None
+    reason: str | None = None
+    error: str | None = None
+    duration_ms: int | None = None
+
+
 class AgentStatus(BaseModel):
     name: str
     title: str
@@ -55,6 +70,7 @@ class AgentStatus(BaseModel):
     duration_ms: int | None = None
     started_at: str | None = None
     completed_at: str | None = None
+    subagents: list[SubAgentStatus] = Field(default_factory=list)
 
 
 class TimelineEntry(BaseModel):
@@ -64,6 +80,8 @@ class TimelineEntry(BaseModel):
     level: str = "info"
     message: str
     agent: str | None = None
+    depth: int = 0  # 0 Brain · 1 lead agent · 2 specialist sub-agent
+    parent: str | None = None
 
 
 class Metrics(BaseModel):
@@ -167,6 +185,7 @@ class MemorySearchResponse(BaseModel):
     verification: dict[str, int]
     notes: list[str]
     llm: LLMInfo
+    trace: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class WalkthroughResponse(BaseModel):
