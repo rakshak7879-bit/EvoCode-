@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from evo_cli.console import Console, Style, enable_line_editing
+from evo_cli.fix_flow import run_fix
 from evo_cli.orchestration import print_orchestration
 from evo_cli.repository import rerun_analysis
 from evo_cli.views import (
@@ -58,6 +59,7 @@ Intelligence
   verify                      Re-check all finding hashes against current source
 
 Working copy
+  fix [GOAL]                  Propose verified patches for the findings, then apply the ones you approve
   edit PATH LINE [TEXT]       Replace one line in the isolated working copy, then detect STALE
   reanalyze [TASK]            Re-run the Brain on the working copy and update memory
 
@@ -71,8 +73,19 @@ Session
 LEVELS = {"l0": 0, "l1": 1, "l2": 2, "brain": 0, "leads": 1, "all": 2}
 COMMANDS = (
     "status", "repos", "use", "tree", "orchestration", "agents", "log", "findings", "show", "source", "ask",
-    "architecture", "walkthrough", "verify", "edit", "reanalyze", "mode", "clear", "help", "exit",
+    "architecture", "walkthrough", "verify", "fix", "edit", "reanalyze", "mode", "clear", "help", "exit",
 )
+#: Commands that only exist as one-shot CLI commands, with the reason.
+ONE_SHOT = {
+    "solve": "solve works on a repository path and an issue: ./evo solve --repo . --issue-file issue.md",
+    "check": "check judges a solve session: ./evo check --session SESSION",
+    "test": "test runs a repository's own suite: ./evo test --repo .",
+    "apply": "apply takes a patch file: ./evo apply --session SESSION --patch fix.patch",
+    "write": "write replaces a file: ./evo write --session SESSION PATH --file NEW",
+    "scan": "scan delegates to Strix: ./evo scan --repo .",
+    "demo": "demo starts a new analysis: ./evo demo",
+    "sessions": "sessions lists solve sessions: ./evo sessions",
+}
 
 
 def parse_location(path: str, line: str | None = None) -> tuple[str, int, int]:
@@ -167,6 +180,12 @@ class InteractiveSession:
         except ValueError as exc:
             self.console.error(str(exc))
             return False, True
+        # People naturally retype the launcher inside the shell: accept "./evo findings".
+        if parts and parts[0] in {"./evo", "evo"}:
+            parts = parts[1:]
+            if parts:
+                self.console.write(self.console.paint(
+                    f"(inside the shell you can just type `{parts[0]}`)", Style.DIM))
         if not parts:
             return True, True
         command, args = parts[0].lower(), parts[1:]
@@ -215,8 +234,13 @@ class InteractiveSession:
                 self._edit(args)
             elif command in {"reanalyze", "analyse", "analyze"}:
                 await self._reanalyze(args)
+            elif command == "fix":
+                await self._fix(args)
             elif command == "mode":
                 print_mode(self.console, self.services)
+            elif command in ONE_SHOT:
+                self.console.error(f"`{command}` is not a shell command. {ONE_SHOT[command]}")
+                return False, True
             else:
                 self.console.error(f"Unknown command: {command}. Type `help` for commands.")
                 return False, True
@@ -342,6 +366,13 @@ class InteractiveSession:
         self.console.success(f"Working copy updated: {result.sha256_before[:10]}… → {result.sha256_after[:10]}…")
         self.console.write(self.console.paint("The original repository was not changed.", Style.DIM))
         self._verify()
+
+    async def _fix(self, args: list[str]) -> None:
+        goal = " ".join(args).strip()
+        applied, _ = await run_fix(self.services, self.console, self.repo(), goal,
+                                   assume_yes=self.scripted, reanalyze=True)
+        if applied:
+            self.last_findings = []
 
     async def _reanalyze(self, args: list[str]) -> None:
         task = " ".join(args).strip() or None

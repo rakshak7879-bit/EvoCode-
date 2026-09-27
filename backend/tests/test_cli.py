@@ -112,7 +112,7 @@ def test_json_outputs_are_machine_readable(cli: Invoke) -> None:
     assert json.loads(cli("--json", "verify", repo_id)[1]) == {
         "repository_id": repo_id, "total": 16, "verified": 16, "stale": 0, "missing": 0}
     code, out, _ = cli("--json", "status", "ffffffff")
-    assert code == 1 and json.loads(out)["error"] == "Repository not found: ffffffff"
+    assert code == 1 and "No analysis found for 'ffffffff'" in json.loads(out)["error"]
 
 
 def test_stale_source_loop_edit_verify_reanalyze(cli: Invoke) -> None:
@@ -198,3 +198,34 @@ def test_cancelled_analysis_is_marked_failed(settings: Settings) -> None:
     asyncio.run(scenario())
     repo = services.store.get_repository(prepared.repository_id)
     assert repo is not None and repo["status"] == "failed" and "cancelled" in repo["error"]
+
+
+def test_repositories_resolve_by_url_path_and_name(cli: Invoke, tmp_path: Path) -> None:
+    """A model (or a person) refers to a repository the way they analyzed it, not by internal id."""
+    folder = tmp_path / "my-project"
+    folder.mkdir()
+    (folder / "app.js").write_text("const KEY = 'sk-live-abcdefghijklmnopqrstuvwx';\nmodule.exports = {};\n")
+    code, out, err = cli("--json", "analyze", str(folder), "--no-shell")
+    assert code == 0, err
+    repo_id = json.loads(out)["repository_id"]
+
+    for reference in (str(folder), "my-project", repo_id[:8]):
+        code, out, err = cli("--json", "status", reference)
+        assert code == 0, f"{reference}: {err}"
+        assert json.loads(out)["repository_id"] == repo_id
+
+    code, out, _ = cli("--json", "status", "https://github.com/nope/missing")
+    assert code == 1 and "No analysis found" in json.loads(out)["error"]
+    code, out, _ = cli("--json", "status", "ffffffff")
+    assert code == 1 and "No analysis found" in json.loads(out)["error"]
+
+
+def test_shell_accepts_fix_and_guides_one_shot_commands(cli: Invoke, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_id = demo_id(cli)
+    monkeypatch.setattr("sys.stdin", io.StringIO("./evo findings security\nsolve\nfix the hardcoded secrets\nexit\n"))
+    code, out, err = cli("open", repo_id)
+    assert "(inside the shell you can just type `findings`)" in out
+    assert "`solve` is not a shell command" in err
+    assert "Proposed fixes" in out and "Hardcoded API key" in out
+    assert "Applied" in out and "isolated working copy" in out
+    assert code == 1, "the rejected `solve` command makes the scripted session exit non-zero"

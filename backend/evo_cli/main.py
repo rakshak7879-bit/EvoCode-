@@ -13,6 +13,7 @@ from typing import Any
 from config import load_settings
 from evo_cli import __version__
 from evo_cli.console import Console, Style
+from evo_cli.fix_flow import run_fix
 from evo_cli.orchestration import orchestration_snapshot, print_orchestration
 from evo_cli.repository import prepare_repository, repository_as_json, rerun_analysis, run_analysis, settings_for_cli
 from evo_cli.orchestration import format_event
@@ -195,7 +196,6 @@ def _add_solve_commands(sub: argparse._SubParsersAction) -> None:  # type: ignor
     fix.add_argument("--yes", "-y", action="store_true", help="apply every verified patch without asking")
     fix.add_argument("--dry-run", action="store_true", help="only show the patches")
     fix.add_argument("--no-reanalyze", action="store_true", help="skip the re-analysis after applying")
-    fix.add_argument("--save-patch", action="store_true", help="also write a .patch file")
 
     scan = sub.add_parser("scan", help="optional deep security scan with Strix (external tool)")
     scan.add_argument("--repo", default=".", help="target repository (default: current directory)")
@@ -550,56 +550,12 @@ async def dispatch_solve(args: argparse.Namespace, services: Services, console: 
 async def _fix(args: argparse.Namespace, services: Services, console: Console) -> int:
     """Fixer Agent: propose verified patches for an analysis, then apply the approved ones."""
     repo = resolve_repository(services.store, args.repository_id)
-    goal = " ".join(args.goal).strip() or "fix all security issues"
-    if not args.json:
-        console.heading("Fixing verified findings", "L0 Evo Brain → L1 Fixer Agent → L2 specialist sub-agents")
-    sink = None if args.json else (lambda event: console.write(format_event(console, event, truncate=console.is_tty)))
-    plan = await services.fixes.plan(repo["id"], goal, sink)
-    if plan.error:
-        if args.json:
-            console.write(json.dumps({"error": plan.error, "goal": goal}))
-        else:
-            console.error(plan.error)
-        return EXIT_ERROR
-    if not args.json:
-        print_fix_plan(console, plan)
-
-    verified = plan.verified
-    if args.dry_run or not verified:
-        if args.json:
-            console.write(json.dumps(plan.to_dict(), indent=2))
-        elif not verified:
-            console.write()
-            console.warning("No patch could be verified automatically; the findings above need a human.")
-        return EXIT_OK if verified or args.dry_run else EXIT_GATE_FAILED
-
-    approved = verified
-    if not args.yes and not args.json:
-        console.write()
-        answer = console.prompt(f"Apply {len(verified)} verified patch(es) to the working copy? [y/N] › ")
-        if (answer or "").strip().lower() not in {"y", "yes"}:
-            console.write(console.paint("Nothing was changed.", Style.DIM))
-            return EXIT_OK
-    elif not args.yes and args.json:
-        console.write(json.dumps({**plan.to_dict(), "applied": [], "note": "pass --yes to apply"}, indent=2))
-        return EXIT_OK
-
-    outcome = services.fixes.apply(repo["id"], approved)
-    if not args.json:
-        console.write()
-        console.success(f"Applied {len(outcome.applied)} patch(es) to {len(outcome.files)} file(s) in the "
-                        "isolated working copy. Your original repository was not changed.")
-        for proposal, reason in outcome.conflicts:
-            console.warning(f"{proposal.id} skipped: {reason}")
-        if outcome.patch_path:
-            console.info(f"Patch saved: {outcome.patch_path} (apply it with `git apply`)")
-    if not args.no_reanalyze and outcome.applied:
-        repo = await rerun_analysis(services, repo["id"], console, json_output=args.json)
-        if not args.json:
-            print_repository_summary(console, services, repo)
-            print_history(console, repo)
-    if args.json:
-        console.write(json.dumps({**plan.to_dict(), **outcome.to_dict()}, indent=2))
+    applied, verified = await run_fix(
+        services, console, repo, " ".join(args.goal),
+        assume_yes=args.yes, dry_run=args.dry_run, reanalyze=not args.no_reanalyze, json_output=args.json,
+    )
+    if not verified and not args.dry_run:
+        return EXIT_GATE_FAILED
     return EXIT_OK
 
 

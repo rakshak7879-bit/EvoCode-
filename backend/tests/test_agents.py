@@ -49,9 +49,15 @@ def test_security_rules_precision() -> None:
     assert not sqli.evaluate("pool.query('SELECT * FROM users WHERE email = $1', [email])")[0]
     secret = rule("hardcoded-secret")
     assert secret.evaluate('const API_KEY = "sk-demo-secret";')[0]
+    assert secret.evaluate('AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"')[0]
+    assert secret.evaluate('password = "Tr0ub4dor&3"')[0]
     assert not secret.evaluate('const API_KEY = process.env.API_KEY;')[0]
     assert not secret.evaluate('const password = "your_password_here";')[0]
     assert not secret.evaluate('"jsonwebtoken": "^9.0.2",')[0]
+    # Sentinel/marker constants are not credentials, however they are named.
+    assert not secret.evaluate('RETRY_WITH_OUTPUT_TOKEN = "###SWE-AGENT-RETRY-WITH-OUTPUT###"')[0]
+    assert not secret.evaluate('RETRY_TOKEN = "SWE-AGENT-RETRY-WITH-OUTPUT"')[0]
+    assert not secret.evaluate('MARKER_SECRET = "<<<END_OF_BLOCK>>>"')[0]
     xss = rule("dom-xss")
     assert xss.evaluate("el.innerHTML = `Hi ${name}`;")[0]
     assert not xss.evaluate("el.innerHTML = '';")[0]

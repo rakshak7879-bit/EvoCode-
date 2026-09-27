@@ -91,12 +91,19 @@ def _secret_title(match: re.Match[str]) -> str:
 
 
 _VERSION_VALUE = re.compile(r"^[~^<>=v]*\d+(?:\.[\dx*]+)*(?:[-+][\w.]+)?$")
+# Sentinel/marker constants such as "###AGENT-RETRY###" or "<<<END_OF_BLOCK>>>": wrapped in a run of
+# punctuation, or shouted with no lowercase letters and no digits. Real credentials have entropy.
+_MARKER_VALUE = re.compile(r"^([^\w\s])\1+.*\1+$")
 
 
 def _valid_secret(match: re.Match[str]) -> bool:
     name, value = match.group(1), match.group(3)
     if _PLACEHOLDER_VALUE.search(value) or _NON_SECRET_NAME.search(name) or _VERSION_VALUE.match(value):
         return False
+    if _MARKER_VALUE.match(value):
+        return False
+    if not any(c.islower() for c in value) and not any(c.isdigit() for c in value):
+        return False  # e.g. RETRY_TOKEN = "SWE-AGENT-RETRY-WITH-OUTPUT"
     return any(c.isdigit() or c in "-_./+=" for c in value) or len(value) >= 16
 
 

@@ -21,21 +21,46 @@ def short_hash(value: str | None, length: int = 12) -> str:
     return (value or "")[:length]
 
 
+def normalize_source(value: str) -> str:
+    """Compare repository sources ignoring scheme, ``www.``, ``.git`` and trailing slashes."""
+    text = value.strip().rstrip("/").lower()
+    for prefix in ("https://www.github.com/", "https://github.com/", "http://github.com/", "git@github.com:"):
+        if text.startswith(prefix):
+            return text[len(prefix):].removesuffix(".git")
+    return text.removesuffix(".git")
+
+
 def resolve_repository(store: MemoryStore, value: str | None) -> dict[str, Any]:
+    """Find an analysis by id, id prefix, GitHub URL, local path or name (most recent wins)."""
     repos = store.list_repositories(limit=500)
-    if value:
-        exact = next((repo for repo in repos if repo["id"] == value), None)
-        if exact:
-            return exact
-        matches = [repo for repo in repos if repo["id"].startswith(value)]
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            raise ValueError(f"Repository prefix {value!r} is ambiguous.")
-        raise ValueError(f"Repository not found: {value}")
-    if not repos:
-        raise ValueError("No repositories have been analyzed yet. Run `./evo demo` or `./evo analyze SOURCE`.")
-    return repos[0]
+    if not value:
+        if not repos:
+            raise ValueError("No repositories have been analyzed yet. Run `./evo demo` or `./evo analyze SOURCE`.")
+        return repos[0]
+
+    exact = next((repo for repo in repos if repo["id"] == value), None)
+    if exact:
+        return exact
+    matches = [repo for repo in repos if repo["id"].startswith(value)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"Repository prefix {value!r} is ambiguous. Run `./evo repos` and use a longer prefix.")
+
+    # Not an id: try the source the analysis came from (URL, folder, ZIP) and its name.
+    target = normalize_source(value)
+    candidates = {target}
+    try:
+        path = Path(value).expanduser()
+        if path.exists():
+            candidates.add(normalize_source(str(path.resolve())))
+    except OSError:
+        pass
+    for repo in repos:  # already ordered newest first
+        if normalize_source(repo.get("source_ref") or "") in candidates or normalize_source(repo["name"]) in candidates:
+            return repo
+    raise ValueError(f"No analysis found for {value!r}. Run `./evo repos` to list analyses, "
+                     f"or analyze it first with `./evo analyze {value}`.")
 
 
 def latest_agent_result(services: Services, repo: dict[str, Any], agent: str) -> dict[str, Any] | None:

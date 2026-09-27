@@ -69,6 +69,7 @@ Prompt: `evo[REPO_ID] ›`
 | `walkthrough` | Presentation-ready two-minute repository tour |
 | `ask QUESTION` | Query FTS5 memory and verify every returned citation |
 | `verify` | Recompute current source hashes for all findings |
+| `fix [GOAL]` | Propose verified patches for the findings, then apply the ones you approve |
 | `edit PATH LINE` | Prompt for a one-line edit in Evo Code's isolated working copy |
 | `reanalyze [TASK]` | Re-scan that copy; update findings and resolved-history memory |
 | `mode` | LLM/local mode, FTS5 availability, data path and the agent roster |
@@ -104,7 +105,9 @@ Brain answer
 
 ## One-shot commands
 
-Every interactive view is also a direct command (repository id defaults to the latest where unambiguous):
+Every interactive view is also a direct command. Where a repository is expected you can pass the id,
+an unambiguous id prefix, or the source you analyzed (a GitHub URL, a folder path or the repository
+name); omit it entirely for the most recent analysis.
 
 ```bash
 ./evo repos
@@ -124,11 +127,15 @@ Every interactive view is also a direct command (repository id defaults to the l
 ### Fixing findings
 
 ```bash
-./evo fix                                  # latest analysis, all security findings
-./evo fix REPO_ID "the hardcoded secrets"  # a focused goal narrows the Fixer's team
-./evo fix --dry-run                        # only show the patches
-./evo fix --yes --save-patch               # apply without asking, export a .patch
+./evo fix                                     # latest analysis, all security findings
+./evo fix "the hardcoded secrets"             # a focused goal narrows the Fixer's team
+./evo fix https://github.com/owner/repo       # any repository you analyzed: URL, folder, name or id
+./evo fix --dry-run                           # only show the patches
+./evo fix --yes                               # apply without asking
 ```
+
+`fix` is also a command inside the interactive shell, where it acts on the repository you have open.
+Every applied patch is exported to `.evo-data/patches/` so you can `git apply` it to your real repo.
 
 The Fixer Agent delegates to five specialists: a Fix Planner picks the findings in scope, a Patch
 Writer rewrites them with line-preserving strategies, a Safety Reviewer rejects anything
