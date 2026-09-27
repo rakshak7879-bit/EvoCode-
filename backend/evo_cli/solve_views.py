@@ -92,7 +92,8 @@ def print_plan(console: Console, session: SolveSession) -> None:
 def print_test_report(console: Console, report: TestReport, *, title: str = "Test run", show_output: bool = False,
                       output_lines: int = 20) -> None:
     style = STATUS_STYLE.get(report.status, Style.DIM)
-    console.heading(title, f"{report.runner} · {' '.join(report.command[-3:])}")
+    where = f" in {report.directory}/" if report.directory else ""
+    console.heading(title, f"{report.runner}{where} · {' '.join(report.command[-3:])}")
     console.write(f"  {status_symbol(console, 'complete' if report.ok else 'failed')} "
                   f"{console.paint(report.status.upper(), Style.BOLD, style)}  {report.summary()}")
     if report.failing:
@@ -176,7 +177,7 @@ def session_payload(session: SolveSession, *, include_snippets: bool = True) -> 
         "issue": session.issue,
         "analysis": session.analysis,
         "suspects": suspects,
-        "tests": {"runner": session.runner, "files": session.tests},
+        "tests": {"runner": session.runner, "directory": session.runner_directory, "files": session.tests},
         "baseline": session.baseline,
         "plan": session.plan,
         "notes": session.notes,

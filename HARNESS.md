@@ -125,6 +125,11 @@ Supported runners, detected automatically: `pytest`, `python -m unittest`, `npm 
 (Jest/Mocha/node:test), `go test`, `cargo test`. Installs are never run: if dependencies
 are missing you get `status: "error"` explaining that, not a silent pass.
 
+Detection looks in the repository root first, then up to two levels down, so a suite under
+`backend/`, `src/` or `packages/api/` is found and run in its own working directory. The
+directory is reported as `tests.directory` by `solve` and `directory` by `test`, and test
+paths you pass with `--tests` stay repository-relative — Evo Code rewrites them.
+
 ### `check` — the gate
 
 ```bash
@@ -137,10 +142,15 @@ Three checks must all pass:
 | --- | --- |
 | `changes` | real source files changed (generated files like `__pycache__` don't count) |
 | `tests` | the whole suite passes |
-| `baseline` | at least one test that failed at the start now passes |
+| `baseline` | a test that failed at the start now passes — or, if nothing failed at the start, the change adds a test |
 
-`--require-new-test` adds a fourth check: a test file must have been added or changed.
-Exit code `0` means solved, `2` means not yet, and `reasons` says what is missing.
+That last rule matters: when `solve` could not reproduce the issue, a green suite proves nothing on
+its own, so the gate asks for a test that fails without your fix and passes with it. Evo Code tells
+coverage from implementation by directory and naming evidence, so a module that merely happens to be
+called `test_runner.py` does not count.
+
+`--require-new-test` also demands a test when the baseline *did* fail. Exit code `0` means solved,
+`2` means not yet, and `reasons` says exactly what is missing.
 
 ### Inspecting and reporting
 

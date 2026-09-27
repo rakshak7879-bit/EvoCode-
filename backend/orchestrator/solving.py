@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -51,6 +52,42 @@ def _is_artifact(path: str) -> bool:
     return normalized.endswith((".pyc", ".pyo", ".log", ".orig", ".rej")) or any(
         part in normalized for part in ARTIFACTS)
 
+
+TEST_DIRECTORIES = frozenset({"test", "tests", "spec", "specs", "__tests__", "testing"})
+#: Names that only ever belong to tests, whatever directory they sit in.
+_UNAMBIGUOUS_TEST = re.compile(r"^.+(?:_test|_spec)\.[a-z]+$|^.+\.(?:test|spec)\.[a-z]+$")
+#: ``test_x.py`` is a test in a suite, but also a plausible module name (``test_runner.py``).
+_PREFIXED_TEST = re.compile(r"^test_.+\.[a-z]+$")
+
+
+def _is_test_path(path: str, root: Path | None = None) -> bool:
+    """Whether a changed file is a test, so the gate can tell coverage from implementation.
+
+    Directory evidence wins. A ``test_*`` name outside a test directory only counts
+    when its neighbours look like a suite too, so a module such as
+    ``repo/test_runner.py`` is not mistaken for coverage.
+    """
+    normalized = path.replace("\\", "/")
+    parts = normalized.lower().split("/")
+    name, directories = parts[-1], parts[:-1]
+    if any(part in TEST_DIRECTORIES for part in directories):
+        return True
+    if _UNAMBIGUOUS_TEST.match(name):
+        return True
+    if not _PREFIXED_TEST.match(name):
+        return False
+    if not directories:
+        return True  # test_x.py at the repository root is a suite of its own
+    if root is None:
+        return True
+    try:
+        siblings = [entry.name.lower() for entry in (root / "/".join(normalized.split("/")[:-1])).iterdir()
+                    if entry.is_file()]
+    except OSError:
+        return True
+    prefixed = sum(1 for sibling in siblings if _PREFIXED_TEST.match(sibling))
+    return prefixed >= 2 or prefixed == len([s for s in siblings if s.endswith(name.rsplit(".", 1)[-1])])
+
 logger = logging.getLogger("evo.solve")
 
 SESSION_VERSION = 1
@@ -77,6 +114,8 @@ class SolveSession:
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     runner: str | None = None
+    #: Where the suite lives, relative to the repository root ("" for the root).
+    runner_directory: str = ""
     tests: list[str] = field(default_factory=list)
     baseline: dict[str, Any] | None = None
     analysis: dict[str, Any] = field(default_factory=dict)
@@ -269,6 +308,7 @@ class SolveCoordinator:
             issue=issue,
             mode="isolated" if isolated else "live",
             runner=data["tests"]["runner"],
+            runner_directory=data["tests"].get("directory", ""),
             tests=list(data["tests"]["tests"]),
             baseline=data["baseline"],
             analysis=data["analysis"],
@@ -285,11 +325,27 @@ class SolveCoordinator:
 
     # ------------------------------------------------------------------ tests
     def runner_for(self, session: SolveSession, key: str | None = None) -> TestRunner:
-        runner = detect_runner(session.path, key or session.runner) or detect_runner(session.path)
-        if runner is None:
-            available = ", ".join(r.key for r in detect_runners(session.path)) or "none"
-            raise SolveError(f"No test runner detected in {session.path} (supported runners found: {available}).")
-        return runner
+        """The runner this session used, or the best one available now."""
+        runners = detect_runners(session.path)
+        wanted = key or session.runner
+        if wanted:
+            exact = next((runner for runner in runners
+                          if runner.key == wanted and runner.directory == session.runner_directory), None)
+            if exact:
+                return exact
+            same_key = next((runner for runner in runners if runner.key == wanted), None)
+            if same_key:
+                return same_key
+            if key:
+                available = ", ".join(sorted({runner.key for runner in runners})) or "none"
+                raise SolveError(f"No {key} runner in {session.path} (detected: {available}).")
+        if runners:
+            return runners[0]
+        raise SolveError(
+            f"No test runner detected in {session.path}. Evo Code looks for pytest, unittest, npm test, "
+            "go test and cargo test in the repository root and up to two levels down. Without one it cannot "
+            "prove a fix works."
+        )
 
     def run_tests(self, session: SolveSession, *, targets: tuple[str, ...] = (), runner_key: str | None = None,
                   scope: str = "suite") -> TestReport:
@@ -409,6 +465,7 @@ class SolveCoordinator:
 
         baseline = session.baseline or {}
         baseline_status = baseline.get("status")
+        tests_changed = [path for path in changed if _is_test_path(path, session.path)]
         if baseline_status == "failed":
             fixed = sorted(set(baseline.get("failing") or []) - set(report.failing))
             improved = suite_ok or bool(fixed)
@@ -418,11 +475,21 @@ class SolveCoordinator:
             if not improved:
                 reasons.append("None of the tests that failed at the start pass now.")
         else:
-            checks.append({"name": "baseline", "ok": True,
-                           "detail": f"no failing baseline to compare ({baseline_status or 'not captured'})"})
+            # Nothing failed at the start, so a passing suite proves nothing on its own:
+            # the change has to bring a test that covers it.
+            checks.append({
+                "name": "baseline",
+                "ok": bool(tests_changed),
+                "detail": (f"nothing failed at the start; coverage added in {', '.join(tests_changed[:3])}"
+                           if tests_changed else
+                           f"nothing failed at the start ({baseline_status or 'no baseline'}), and no test "
+                           "was added to cover the change"),
+            })
+            if not tests_changed:
+                reasons.append("No test failed at the start, so add a test that fails without your fix and "
+                               "passes with it. Otherwise nothing proves the issue is solved.")
 
-        if require_new_test:
-            tests_changed = [path for path in changed if any(part in path for part in ("test", "spec"))]
+        if require_new_test and baseline_status == "failed":
             checks.append({"name": "new-test", "ok": bool(tests_changed),
                            "detail": ", ".join(tests_changed[:3]) or "no test file was added or changed"})
             if not tests_changed:

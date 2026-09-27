@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from repo.filters import IGNORED_DIRS
+
 logger = logging.getLogger("evo.tests")
 
 MAX_OUTPUT_BYTES = 256 * 1024
@@ -53,7 +55,13 @@ SAFE_ENV = {
 
 @dataclass(frozen=True)
 class TestRunner:
-    """A detected way to run a repository's tests."""
+    """A detected way to run a repository's tests.
+
+    ``directory`` is where the suite actually lives, relative to the repository
+    root (``""`` for the root itself). Most real repositories keep their tests
+    one level down — ``backend/``, ``src/``, ``packages/api/`` — so the runner
+    carries its own working directory instead of assuming the root.
+    """
 
     key: str
     title: str
@@ -61,6 +69,17 @@ class TestRunner:
     evidence: str
     #: How to restrict the run to selected tests (``{targets}`` is replaced).
     select: tuple[str, ...] = ()
+    directory: str = ""
+
+    def working_directory(self, root: Path) -> Path:
+        return root / self.directory if self.directory else root
+
+    def select_targets(self, paths: tuple[str, ...]) -> tuple[str, ...]:
+        """Repository-relative test paths rewritten relative to this runner's directory."""
+        if not self.directory:
+            return paths
+        prefix = self.directory.rstrip("/") + "/"
+        return tuple(path[len(prefix):] for path in paths if path.startswith(prefix))
 
     def command_for(self, targets: tuple[str, ...] = ()) -> tuple[str, ...]:
         if not targets or not self.select:
@@ -72,7 +91,7 @@ class TestRunner:
 
     @property
     def display(self) -> str:
-        return " ".join(self.command)
+        return f"{self.directory}: {' '.join(self.command)}" if self.directory else " ".join(self.command)
 
 
 @dataclass
@@ -92,6 +111,8 @@ class TestReport:
     output: str = ""
     message: str = ""
     truncated: bool = False
+    #: Where the suite ran, relative to the repository root ("" for the root).
+    directory: str = ""
 
     @property
     def ok(self) -> bool:
@@ -115,6 +136,7 @@ class TestReport:
     def to_dict(self, *, include_output: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "runner": self.runner,
+            "directory": self.directory,
             "command": list(self.command),
             "status": self.status,
             "ok": self.ok,
@@ -174,40 +196,111 @@ def _has_test_script(root: Path) -> bool:
     return bool(script) and "no test specified" not in script
 
 
-def _python_executable(root: Path, name: str) -> str | None:
-    """Prefer a virtualenv inside the repository, then Evo Code's own interpreter, then PATH."""
-    for candidate in (root / ".venv" / "bin" / name, root / "venv" / "bin" / name,
-                      Path(sys.prefix) / "bin" / name):
+def _python_executable(directory: Path, root: Path, name: str) -> str | None:
+    """Prefer a virtualenv beside the suite, then one at the repository root, then this interpreter."""
+    candidates = [directory / ".venv" / "bin" / name, directory / "venv" / "bin" / name]
+    if directory != root:
+        candidates += [root / ".venv" / "bin" / name, root / "venv" / "bin" / name]
+    candidates.append(Path(sys.prefix) / "bin" / name)
+    for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
     return shutil.which(name)
 
 
-def detect_runners(root: Path) -> list[TestRunner]:
-    """Every runner supported by this repository, best first."""
+#: Directories that commonly hold a sub-project's test suite, tried before other siblings.
+PREFERRED_DIRS = ("backend", "server", "api", "src", "app", "lib", "core", "packages", "services", "python", "web")
+MAX_SEARCH_DIRECTORIES = 60
+
+
+def _searchable(directory: Path) -> bool:
+    name = directory.name
+    return directory.is_dir() and not name.startswith(".") and name not in IGNORED_DIRS
+
+
+def _candidate_directories(root: Path) -> list[Path]:
+    """The root, then its subdirectories up to two levels down (monorepo layouts)."""
+    candidates = [root]
+    try:
+        level_one = sorted((path for path in root.iterdir() if _searchable(path)), key=_directory_rank)
+    except OSError:
+        return candidates
+    candidates.extend(level_one)
+    for directory in level_one:
+        if len(candidates) >= MAX_SEARCH_DIRECTORIES:
+            break
+        try:
+            candidates.extend(sorted((path for path in directory.iterdir() if _searchable(path)),
+                                     key=_directory_rank))
+        except OSError:
+            continue
+    return candidates[:MAX_SEARCH_DIRECTORIES]
+
+
+def _directory_rank(directory: Path) -> tuple[int, str]:
+    name = directory.name.lower()
+    return (PREFERRED_DIRS.index(name) if name in PREFERRED_DIRS else len(PREFERRED_DIRS), name)
+
+
+def _detect_in(directory: Path, root: Path) -> list[TestRunner]:
+    relative = "" if directory == root else directory.relative_to(root).as_posix()
     found: list[TestRunner] = []
     for detector in DETECTORS:
-        markers = [marker for marker in detector.markers if (root / marker).exists()]
+        markers = [marker for marker in detector.markers if (directory / marker).exists()]
         if not markers:
             continue
         if detector.key == "pytest":
             text = ""
             for marker in markers:
                 try:
-                    text += (root / marker).read_text(encoding="utf-8", errors="replace")
+                    text += (directory / marker).read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     continue
-            has_tests = (root / "tests").is_dir() or any(root.glob("test_*.py"))
+            has_tests = (directory / "tests").is_dir() or any(directory.glob("test_*.py"))
             if not (any(hint in text for hint in _PYTEST_MARKERS) or has_tests):
                 continue
-        if detector.requires_script == "test" and not _has_test_script(root):
+        if detector.key == "unittest" and not (directory / "tests").is_dir():
             continue
-        executable = (_python_executable(root, detector.executable) if detector.key == "pytest"
-                      else (detector.executable if detector.key == "unittest" else shutil.which(detector.executable)))
+        if detector.requires_script == "test" and not _has_test_script(directory):
+            continue
+        if detector.key in {"pytest", "unittest"}:
+            executable = _python_executable(directory, root, detector.executable) \
+                if detector.key == "pytest" else detector.executable
+        else:
+            executable = shutil.which(detector.executable)
         if not executable:
             continue
-        found.append(TestRunner(detector.key, detector.title, (executable, *detector.arguments),
-                                f"found {markers[0]}", detector.select))
+        evidence = f"found {relative + '/' if relative else ''}{markers[0]}"
+        found.append(TestRunner(detector.key, detector.title, (executable, *detector.arguments), evidence,
+                                detector.select, relative))
+    return found
+
+
+def detect_runners(root: Path) -> list[TestRunner]:
+    """Every runner this repository supports, best first, including sub-project suites.
+
+    The repository root is tried first; if it has no suite of its own, subdirectories
+    up to two levels down are searched, with conventional names (``backend``, ``src``,
+    ``packages`` …) first, so a monorepo's tests are still found and still run in the
+    right working directory.
+    """
+    found: list[TestRunner] = []
+    seen: set[tuple[str, str]] = set()
+    claimed: list[str] = []
+    for directory in _candidate_directories(root):
+        relative = "" if directory == root else directory.relative_to(root).as_posix()
+        if any(relative.startswith(parent + "/") for parent in claimed):
+            continue  # a parent directory already owns this suite
+        runners = _detect_in(directory, root)
+        for runner in runners:
+            key = (runner.key, runner.directory)
+            if key not in seen:
+                seen.add(key)
+                found.append(runner)
+        if runners:
+            if directory == root:
+                break  # a suite at the root wins outright
+            claimed.append(relative)
     return found
 
 
@@ -292,18 +385,24 @@ def run_tests(
     timeout: float = 300.0,
     allow_execution: bool = True,
 ) -> TestReport:
-    """Execute ``runner`` in ``root`` and report the outcome. Never raises for test failures."""
-    command = runner.command_for(targets)
+    """Execute ``runner`` in its own directory under ``root``. Never raises for test failures.
+
+    ``targets`` are repository-relative paths; they are rewritten relative to the
+    runner's directory, and any that fall outside it are dropped.
+    """
+    command = runner.command_for(runner.select_targets(targets))
     if not allow_execution:
-        return TestReport(runner.key, command, "skipped",
+        return TestReport(runner.key, command, "skipped", directory=runner.directory,
                           message="Test execution is disabled (EVO_ALLOW_TEST_EXECUTION=false).")
-    if not root.is_dir():
-        return TestReport(runner.key, command, "error", message=f"Repository path does not exist: {root}")
+    working = runner.working_directory(root)
+    if not working.is_dir():
+        return TestReport(runner.key, command, "error", directory=runner.directory,
+                          message=f"Test directory does not exist: {working}")
     started = time.monotonic()
     try:
         process = subprocess.Popen(  # noqa: S603 - command comes from DETECTORS, never from repository content
             command,
-            cwd=str(root),
+            cwd=str(working),
             env=_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -313,7 +412,8 @@ def run_tests(
             errors="replace",
         )
     except (OSError, ValueError) as exc:
-        return TestReport(runner.key, command, "error", message=f"Could not start the test command: {exc}")
+        return TestReport(runner.key, command, "error", directory=runner.directory,
+                          message=f"Could not start the test command: {exc}")
     timed_out = False
     try:
         output = process.communicate(timeout=timeout)[0] or ""
@@ -338,7 +438,8 @@ def run_tests(
                    "(missing dependencies or a collection error).")
     logger.info("Test run finished", extra={"runner": runner.key, "status": status, "duration_ms": duration})
     return TestReport(runner.key, command, status, exit_code, duration, stats["passed"], stats["failed"],
-                      stats["skipped"], stats["errors"], tuple(stats["failing"]), output, message, truncated)
+                      stats["skipped"], stats["errors"], tuple(stats["failing"]), output, message, truncated,
+                      runner.directory)
 
 
 def _terminate(process: subprocess.Popen[str]) -> str:

@@ -343,3 +343,70 @@ def test_strix_scan_cli_reports_availability(cli: Invoke, monkeypatch: pytest.Mo
     assert code == 1 and payload["available"] is False and payload["missing"]
     code, out, _ = cli("scan", "--check")
     assert code == 1 and "Strix is not available" in out
+
+
+def test_detects_a_suite_in_a_subdirectory(tmp_path: Path, target: Path) -> None:
+    """Most repositories keep tests under backend/, src/ or packages/*, not at the root."""
+    root = tmp_path / "monorepo"
+    (root / "frontend").mkdir(parents=True)
+    (root / "frontend" / "index.js").write_text("export const x = 1;\n")
+    (root / "backend").mkdir()
+    for name in ("textlib.py", "pytest.ini"):
+        (root / "backend" / name).write_text((target / name).read_text())
+    (root / "backend" / "tests").mkdir()
+    (root / "backend" / "tests" / "test_textlib.py").write_text((target / "tests" / "test_textlib.py").read_text())
+
+    runners = detect_runners(root)
+    assert runners and runners[0].key == "pytest"
+    assert runners[0].directory == "backend" and "backend/pytest.ini" in runners[0].evidence
+    assert not any(runner.directory.startswith("backend/") for runner in runners), "nested suites are not duplicated"
+
+    # Repository-relative targets are rewritten for the runner's directory; outsiders are dropped.
+    assert runners[0].select_targets(("backend/tests/test_textlib.py", "frontend/a.test.js")) == \
+        ("tests/test_textlib.py",)
+    report = run_tests(root, runners[0], targets=("backend/tests/test_textlib.py",), timeout=120)
+    assert report.status == "failed" and report.directory == "backend"
+    assert report.failing == ("tests/test_textlib.py::test_split_lines_handles_all_endings",)
+    assert "backend" in report.to_dict()["directory"]
+
+
+def test_solve_uses_the_subdirectory_suite(settings: Settings, tmp_path: Path, target: Path) -> None:
+    root = tmp_path / "project"
+    (root / "backend").mkdir(parents=True)
+    for name in ("textlib.py", "pytest.ini"):
+        (root / "backend" / name).write_text((target / name).read_text())
+    (root / "backend" / "tests").mkdir()
+    (root / "backend" / "tests" / "test_textlib.py").write_text((target / "tests" / "test_textlib.py").read_text())
+
+    services = build_services(settings)
+    session = __import__("asyncio").run(services.solve.solve(root, ISSUE))
+    assert session.runner == "pytest" and session.runner_directory == "backend"
+    assert session.baseline["status"] == "failed", "the baseline must be captured from the subdirectory suite"
+    assert session.suspects[0]["file"] == "backend/textlib.py"
+
+    services.solve.write_file(session, "backend/textlib.py", BUGGY.replace(
+        '    lines = text.replace("\\r\\n", "\\n").split("\\n")', FIX))
+    gate = services.solve.check(session)
+    assert gate.passed and gate.report.directory == "backend"
+
+
+def test_gate_requires_a_test_when_nothing_failed_at_the_start(settings: Settings, target: Path) -> None:
+    """A passing suite proves nothing on its own: the change must bring coverage."""
+    (target / "textlib.py").write_text(BUGGY.replace(
+        '    lines = text.replace("\\r\\n", "\\n").split("\\n")', FIX))
+    services = build_services(settings)
+    session = __import__("asyncio").run(services.solve.solve(target, "make join_lines accept a generator"))
+    assert session.baseline["status"] == "passed"
+
+    services.solve.write_file(session, "textlib.py", (target / "textlib.py").read_text().replace(
+        'return "\\n".join(lines)', 'return "\\n".join(list(lines))'))
+    without_test = services.solve.check(session)
+    assert not without_test.passed
+    assert any("add a test that fails without your fix" in reason for reason in without_test.reasons)
+
+    services.solve.write_file(session, "tests/test_join.py",
+                              "from textlib import join_lines\n\n\n"
+                              "def test_join_accepts_a_generator():\n"
+                              "    assert join_lines(str(n) for n in range(3)) == '0\\n1\\n2'\n")
+    with_test = services.solve.check(session)
+    assert with_test.passed and any("coverage added in" in check["detail"] for check in with_test.checks)

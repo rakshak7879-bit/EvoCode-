@@ -423,18 +423,28 @@ class SolverAgent(BaseAgent):
         suspects: list[Suspect] = upstream["locator"].value
         runners = detect_runners(root)
         tests = related_tests(context, upstream["analyst"].value, suspects)
-        return SubAgentOutput(summary=f"{len(runners)} runner(s), {len(tests)} covering test file(s)",
-                              value={"runners": [r.key for r in runners], "runner": runners[0].key if runners else None,
-                                     "command": runners[0].display if runners else None, "tests": tests},
-                              metrics={"runners": len(runners), "tests": len(tests)})
+        chosen = runners[0] if runners else None
+        where = f" in {chosen.directory}/" if chosen and chosen.directory else ""
+        summary = (f"{chosen.title}{where} ({chosen.evidence})" if chosen
+                   else "no test runner found (pytest, unittest, npm, go or cargo)")
+        return SubAgentOutput(
+            summary=f"{summary} · {len(tests)} covering test file(s)",
+            value={"runners": [r.key for r in runners], "runner": chosen.key if chosen else None,
+                   "directory": chosen.directory if chosen else "", "command": chosen.display if chosen else None,
+                   "tests": tests},
+            metrics={"runners": len(runners), "tests": len(tests)},
+        )
 
     def _reproduce(self, context: AgentContext, upstream: Upstream) -> SubAgentOutput:
         root = Path(context.upstream["issue"].data["root"])
         scout = upstream["scout"].value
         runners = detect_runners(root)
-        runner: TestRunner | None = next((r for r in runners if r.key == scout["runner"]), None)
+        runner: TestRunner | None = next((r for r in runners if r.key == scout["runner"]
+                                          and r.directory == scout["directory"]), None)
         if runner is None:
-            return SubAgentOutput(summary="No test runner detected: no baseline to capture", value=None)
+            return SubAgentOutput(
+                summary="No test runner detected: no failing baseline, so the gate cannot prove a fix",
+                value=None)
         targets = tuple(scout["tests"])
         report = run_tests(root, runner, targets=targets, timeout=self.test_timeout,
                            allow_execution=self.run_tests_enabled)

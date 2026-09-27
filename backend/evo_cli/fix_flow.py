@@ -8,6 +8,7 @@ re-run the analysis so memory records the findings as resolved.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from evo_cli.console import Console, Style
@@ -16,6 +17,16 @@ from evo_cli.repository import rerun_analysis
 from evo_cli.solve_views import print_fix_plan
 from evo_cli.views import print_history, print_repository_summary
 from services import Services
+
+
+@dataclass(frozen=True)
+class FixOutcome:
+    """What the fix flow did, so callers can choose an exit code."""
+
+    in_scope: int          # findings the goal selected
+    verified: int          # patches that passed review and verification
+    applied: int           # patches written to the working copy
+    manual: int            # findings handed back to a human
 
 
 async def run_fix(
@@ -28,8 +39,8 @@ async def run_fix(
     dry_run: bool = False,
     reanalyze: bool = True,
     json_output: bool = False,
-) -> tuple[bool, int]:
-    """Returns ``(something_was_applied, patch_count)``. Raises ValueError on a fix failure."""
+) -> FixOutcome:
+    """Plan, review and optionally apply fixes. Raises ValueError if the Fixer itself failed."""
     if not json_output:
         console.heading("Fixing verified findings", "L0 Evo Brain → L1 Fixer Agent → L2 specialist sub-agents")
     sink = None if json_output else (lambda event: console.write(format_event(console, event,
@@ -41,23 +52,31 @@ async def run_fix(
         print_fix_plan(console, plan)
 
     verified = plan.verified
+    counts = FixOutcome(plan.in_scope, len(verified), 0, len(plan.manual))
     if dry_run or not verified:
         if json_output:
             console.write(json.dumps(plan.to_dict(), indent=2))
         elif not verified:
             console.write()
-            console.warning("No patch could be verified automatically; the findings above need a human.")
-        return False, len(verified)
+            if not plan.in_scope:
+                console.info(f"Nothing matched this goal ({plan.scope}). "
+                             "Run `./evo findings` to see what was found.")
+            elif plan.manual:
+                console.warning(f"None of the {plan.in_scope} finding(s) in scope can be fixed safely and "
+                                "automatically; the reasons are listed above.")
+            else:
+                console.warning("No patch could be verified automatically.")
+        return counts
 
     if not assume_yes:
         if json_output:
             console.write(json.dumps({**plan.to_dict(), "applied": [], "note": "pass --yes to apply"}, indent=2))
-            return False, len(verified)
+            return counts
         console.write()
         answer = console.prompt(f"Apply {len(verified)} verified patch(es) to the working copy? [y/N] › ")
         if (answer or "").strip().lower() not in {"y", "yes"}:
             console.write(console.paint("Nothing was changed.", Style.DIM))
-            return False, len(verified)
+            return counts
 
     outcome = services.fixes.apply(repo["id"], verified)
     if not json_output:
@@ -75,4 +94,4 @@ async def run_fix(
             print_history(console, updated)
     if json_output:
         console.write(json.dumps({**plan.to_dict(), **outcome.to_dict()}, indent=2))
-    return bool(outcome.applied), len(verified)
+    return FixOutcome(plan.in_scope, len(verified), len(outcome.applied), len(plan.manual))

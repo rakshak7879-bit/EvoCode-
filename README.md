@@ -56,8 +56,9 @@ Give Evo Code an issue and it does the parts a model is weakest at, then judges 
 ```
 
 The gate only passes when real source files changed, the whole suite passes, and a test that failed
-at the start now passes. Supported runners are detected automatically: pytest, unittest, npm
-(Jest/Mocha/node:test), go test and cargo test. Full contract, JSON shapes and exit codes:
+at the start now passes — or, when nothing failed at the start, the change brings a test with it.
+Runners are detected automatically (pytest, unittest, npm, go, cargo), including suites that live in
+a subdirectory such as `backend/` or `packages/api/`. Full contract, JSON shapes and exit codes:
 [HARNESS.md](HARNESS.md).
 
 ## Optional web dashboard

@@ -467,7 +467,10 @@ async def dispatch_solve(args: argparse.Namespace, services: Services, console: 
         print_breakdown(console, session)
         print_suspects(console, session)
         if session.baseline:
-            print_test_report(console, TestReport(**_report_fields(session.baseline)), title="Failing baseline")
+            reproduced = session.baseline.get("status") == "failed"
+            print_test_report(console, TestReport(**_report_fields(session.baseline)),
+                              title="Baseline · issue reproduced" if reproduced
+                              else "Baseline · issue not reproduced yet")
         print_plan(console, session)
         print_solve_summary(console, session)
         return EXIT_OK
@@ -581,11 +584,12 @@ async def _fix(args: argparse.Namespace, services: Services, console: Console) -
     if repo is None:
         repo = resolve_repository(services.store, None)
     goal = (args.goal_text or " ".join(words)).strip()
-    applied, verified = await run_fix(
+    outcome = await run_fix(
         services, console, repo, goal,
         assume_yes=args.yes, dry_run=args.dry_run, reanalyze=not args.no_reanalyze, json_output=args.json,
     )
-    if not verified and not args.dry_run:
+    # Exit 2 only when there was something to fix and no patch could be verified.
+    if outcome.in_scope and not outcome.verified and not args.dry_run:
         return EXIT_GATE_FAILED
     return EXIT_OK
 

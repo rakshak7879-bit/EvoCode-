@@ -368,10 +368,9 @@ class InteractiveSession:
         self._verify()
 
     async def _fix(self, args: list[str]) -> None:
-        goal = " ".join(args).strip()
-        applied, _ = await run_fix(self.services, self.console, self.repo(), goal,
-                                   assume_yes=self.scripted, reanalyze=True)
-        if applied:
+        outcome = await run_fix(self.services, self.console, self.repo(), " ".join(args).strip(),
+                                assume_yes=self.scripted, reanalyze=True)
+        if outcome.applied:
             self.last_findings = []
 
     async def _reanalyze(self, args: list[str]) -> None:
