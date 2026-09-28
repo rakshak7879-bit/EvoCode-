@@ -63,6 +63,8 @@ class TestRunner:
     carries its own working directory instead of assuming the root.
     """
 
+    __test__ = False
+
     key: str
     title: str
     command: tuple[str, ...]
@@ -97,6 +99,8 @@ class TestRunner:
 @dataclass
 class TestReport:
     """Outcome of one test run."""
+
+    __test__ = False
 
     runner: str
     command: tuple[str, ...]

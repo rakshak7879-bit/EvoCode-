@@ -10,11 +10,18 @@ from pathlib import Path
 
 import pytest
 
-from agents.solver import analyze_issue, issue_terms, weighted_terms
+from agents.solver import (
+    Suspect,
+    analyze_issue,
+    failure_signals,
+    issue_terms,
+    rerank_by_failure,
+    weighted_terms,
+)
 from config import Settings
 from evo_cli.main import EXIT_GATE_FAILED, EXIT_OK, EXIT_TESTS_FAILED, main
 from llm.provider import DeepSeekProvider, MockProvider, OpenAIProvider, create_provider
-from orchestrator.solving import SolveError
+from orchestrator.solving import SolveCoordinator, SolveError
 from repo import strix_adapter as strix
 from repo.test_runner import detect_runner, detect_runners, parse_output, run_tests
 from services import build_services
@@ -203,7 +210,7 @@ def test_gate_rejects_then_accepts_the_fix(settings: Settings, target: Path) -> 
     services.solve.write_file(session, "textlib.py", BUGGY.replace("if not text:", "if not text:  # noqa"))
     still_broken = services.solve.check(session)
     assert not still_broken.passed
-    assert {check["name"] for check in still_broken.checks} == {"changes", "tests", "baseline"}
+    assert {check["name"] for check in still_broken.checks} == {"changes", "tests", "baseline", "tests-intact"}
     assert next(c for c in still_broken.checks if c["name"] == "changes")["ok"] is True
     assert next(c for c in still_broken.checks if c["name"] == "tests")["ok"] is False
 
@@ -228,8 +235,104 @@ def test_apply_patch_requires_a_real_change(settings: Settings, target: Path) ->
         services.solve.apply_patch(session, patch)  # already applied: context no longer matches
     with pytest.raises(SolveError, match="empty"):
         services.solve.apply_patch(session, "   ")
-    with pytest.raises(SolveError, match="diff --git"):
+    with pytest.raises(SolveError, match="file headers"):
         services.solve.apply_patch(session, "just some text")
+
+
+def test_gate_sees_direct_edits_and_rejects_a_rewritten_test(settings: Settings, target: Path) -> None:
+    """A model edits files with its own tools, so the gate cannot rely on `apply`/`write`.
+
+    It also must not accept "make the assertion match the bug": if the failing test
+    itself was rewritten, a passing suite proves nothing.
+    """
+    services = build_services(settings)
+    session = __import__("asyncio").run(services.solve.solve(target, ISSUE))
+    assert session.baseline and session.baseline["status"] == "failed"
+
+    # Nothing has changed yet, and the gate should say so.
+    assert services.solve.changed_files(session) == []
+
+    # The model edits the implementation directly — no harness command involved.
+    source = target / "textlib.py"
+    source.write_text(source.read_text().replace(
+        '    lines = text.replace("\\r\\n", "\\n").split("\\n")', FIX))
+    assert services.solve.changed_files(session) == ["textlib.py"], "a direct edit must be visible"
+
+    gate = services.solve.check(session)
+    assert gate.passed and [c["name"] for c in gate.checks] == ["changes", "tests", "baseline", "tests-intact"]
+
+    # Now the cheat: revert the fix and weaken the test instead.
+    source.write_text(BUGGY)
+    suite = target / "tests" / "test_textlib.py"
+    suite.write_text(suite.read_text().replace(
+        'assert split_lines("a\\r\\nb\\rc\\n") == ["a", "b", "c"]',
+        'assert split_lines("a\\r\\nb\\rc\\n") == ["a", "b\\rc"]'))
+
+    cheated = services.solve.check(session)
+    assert cheated.passed is False, "rewriting the failing test must not pass the gate"
+    intact = next(check for check in cheated.checks if check["name"] == "tests-intact")
+    assert intact["ok"] is False and "test_textlib.py" in intact["detail"]
+    assert any("proves nothing" in reason for reason in cheated.reasons)
+
+    # An explicit override exists for the case where the test really was wrong.
+    assert services.solve.check(session, allow_test_edits=True).passed
+
+
+def test_failure_signals_blame_the_asserted_call() -> None:
+    """pytest reports which call produced the wrong value; that must outweigh a name match."""
+    output = textwrap.dedent("""\
+        _____________________ test_discount_rounds_half_up _____________________
+
+            def test_discount_rounds_half_up():
+                five = Discount(code="FIVE", percent=5)
+        >       assert discount_amount(1050, five) == 53
+        E       AssertionError: assert 52 == 53
+        E        +  where 52 = discount_amount(1050, Discount(code='FIVE', percent=5))
+        tests/test_discounts.py:28: AssertionError
+    """)
+    weights = failure_signals(output)
+    assert weights["discount_amount"] > weights.get("Discount", 0.0)
+    assert "assert" not in weights, "keywords are noise, not suspects"
+
+    # Ranking: the blamed function starts far behind on name matching alone and still wins.
+    suspects = [
+        Suspect(file="d.py", line_start=10, line_end=23, symbol="Discount", score=6.7, reasons=["name match"]),
+        Suspect(file="d.py", line_start=36, line_end=46, symbol="discount_amount", score=2.6),
+        Suspect(file="m.py", line_start=8, line_end=11, symbol="to_cents", score=2.5),
+    ]
+    ranked = rerank_by_failure(suspects, output)
+    assert [s.symbol for s in ranked[:2]] == ["discount_amount", "Discount"]
+    assert "the failing test blames this call" in ranked[0].reasons
+    assert suspects[0].score == 6.7, "the original ranking is left untouched"
+    # Unrelated symbols keep their score, and no output means no change.
+    assert ranked[-1].symbol == "to_cents" and ranked[-1].score == 2.5
+    assert [s.symbol for s in rerank_by_failure(suspects, "")] == ["Discount", "discount_amount", "to_cents"]
+
+
+def test_patch_targets_accepts_the_shapes_models_emit() -> None:
+    """A model rarely writes a `git diff` header; plain unified diffs must work."""
+    targets = SolveCoordinator._patch_targets
+
+    git_style = "\n".join(["diff --git a/src/app.py b/src/app.py",
+                           "--- a/src/app.py", "+++ b/src/app.py", "@@ -1 +1 @@", "-a", "+b"])
+    assert targets(git_style) == (["src/app.py"], 1)
+
+    # `difflib.unified_diff` output: a/ and b/ prefixes, no git header.
+    assert targets("--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-a\n+b") == (["src/app.py"], 1)
+
+    # No prefixes at all: the path must survive intact, so no component is stripped.
+    assert targets("--- src/app.py\n+++ src/app.py\n@@ -1 +1 @@\n-a\n+b") == (["src/app.py"], 0)
+
+    # `diff -u` adds a tab and a timestamp to each header.
+    tabbed = "--- src/app.py\t2026-01-01 10:00:00\n+++ src/app.py\t2026-01-01 10:01:00\n@@ -1 +1 @@\n-a\n+b"
+    assert targets(tabbed) == (["src/app.py"], 0)
+
+    # A new file: /dev/null is not a target, the other side is.
+    assert targets("--- /dev/null\n+++ b/tests/test_new.py\n@@ -0,0 +1 @@\n+x") == (["tests/test_new.py"], 1)
+    # A deletion: fall back to the path being removed.
+    assert targets("--- a/old.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-x") == (["old.py"], 1)
+
+    assert targets("no headers here") == ([], 0)
 
 
 def test_solve_cli_end_to_end(cli: Invoke, target: Path, tmp_path: Path) -> None:

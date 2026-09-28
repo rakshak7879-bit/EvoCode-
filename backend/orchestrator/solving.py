@@ -53,6 +53,20 @@ def _is_artifact(path: str) -> bool:
         part in normalized for part in ARTIFACTS)
 
 
+#: The "this side does not exist" placeholder in a unified diff header.
+_NO_FILE = "/dev/null"
+#: ``diff -u`` appends a tab and a timestamp to each file header.
+_HEADER_TAIL = re.compile(r"\t.*$")
+
+
+def _header_path(value: str) -> str:
+    """Read the path out of a ``---``/``+++`` diff header line."""
+    text = _HEADER_TAIL.sub("", value.strip())
+    if len(text) > 1 and text.startswith('"') and text.endswith('"'):
+        text = text[1:-1]
+    return text
+
+
 TEST_DIRECTORIES = frozenset({"test", "tests", "spec", "specs", "__tests__", "testing"})
 #: Names that only ever belong to tests, whatever directory they sit in.
 _UNAMBIGUOUS_TEST = re.compile(r"^.+(?:_test|_spec)\.[a-z]+$|^.+\.(?:test|spec)\.[a-z]+$")
@@ -373,13 +387,16 @@ class SolveCoordinator:
         git = shutil.which("git")
         if git is None:
             raise SolveError("git is required to apply a patch. Use `./evo write` for single-file changes.")
-        files = sorted({line.split(" b/", 1)[-1].strip() for line in patch.splitlines()
-                        if line.startswith("diff --git ")})
+        files, strip = self._patch_targets(patch)
         if not files:
-            raise SolveError("The patch has no 'diff --git' header, so the target files are unknown.")
+            raise SolveError("The patch has no '--- '/'+++ ' file headers, so the target files are "
+                             "unknown. Emit a unified diff (`diff -u`) or a `git diff`.")
         before = {path: self._digest(session.path / path) for path in files}
+        # Keep the original text so `diff` and `--save-patch` still work when the
+        # repository is not under git and cannot be diffed after the fact.
+        source = {path: self._read(session.path / path) for path in files}
 
-        options = ["--whitespace=nowarn", "-p1"]
+        options = ["--whitespace=nowarn", f"-p{strip}"]
         cwd = session.path
         toplevel = self._toplevel(session)
         if toplevel is not None and toplevel != session.path:
@@ -404,16 +421,60 @@ class SolveCoordinator:
             hint = " git reported: " + output.strip().splitlines()[0] if output.strip() else ""
             raise SolveError(f"The patch applied cleanly but changed nothing.{hint} "
                              "Check that its paths are relative to the repository root you passed to `solve`.")
-        entry = {"at": utc_now(), "kind": "patch", "files": changed, "bytes": len(patch)}
+        recorded = "".join(unified_diff(path, source.get(path) or "", self._read(session.path / path) or "")
+                           for path in changed)
+        entry = {"at": utc_now(), "kind": "patch", "files": changed, "bytes": len(patch), "diff": recorded}
         session.edits.append(entry)
         self.sessions.save(session)
         logger.info("Patch applied", extra={"session": session.id, "files": len(changed)})
         return entry
 
     @staticmethod
+    def _patch_targets(patch: str) -> tuple[list[str], int]:
+        """Work out which files a diff touches, plus the ``-p`` level git needs.
+
+        Both shapes are accepted: a ``git diff`` (paths prefixed ``a/`` and ``b/``)
+        and the plain unified diff that ``diff -u``, ``difflib`` and most language
+        models emit, with or without those prefixes. The strip level is derived from
+        the headers rather than assumed, so an unprefixed ``+++ src/app.py`` is not
+        mistakenly shortened to ``app.py``.
+        """
+        pairs: list[tuple[str, str]] = []
+        old: str | None = None
+        for raw in patch.splitlines():
+            if raw.startswith("--- "):
+                old = _header_path(raw[4:])
+            elif raw.startswith("+++ ") and old is not None:
+                pairs.append((old, _header_path(raw[4:])))
+                old = None
+        named = [path for pair in pairs for path in pair if path and path != _NO_FILE]
+        prefixed = bool(named) and all(path.startswith(("a/", "b/")) for path in named)
+        strip = 1 if prefixed else 0
+        files: list[str] = []
+        for before, after in pairs:
+            # A deletion has no "after" side, so fall back to the original path.
+            chosen = after if after and after != _NO_FILE else before
+            if not chosen or chosen == _NO_FILE:
+                continue
+            if strip:
+                head, _, tail = chosen.partition("/")
+                chosen = tail or head
+            if chosen not in files:
+                files.append(chosen)
+        return sorted(files), strip
+
+    @staticmethod
     def _digest(path: Path) -> str | None:
         try:
             return sha256_bytes(path.read_bytes())
+        except OSError:
+            return None
+
+    @staticmethod
+    def _read(path: Path) -> str | None:
+        """Decode a file for diffing, or ``None`` when it cannot be read."""
+        try:
+            return decode_source(path.read_bytes())
         except OSError:
             return None
 
@@ -440,7 +501,26 @@ class SolveCoordinator:
         return entry
 
     # ------------------------------------------------------------------ the gate
-    def check(self, session: SolveSession, *, require_new_test: bool = False) -> GateResult:
+    def _failing_test_files(self, session: SolveSession) -> list[str]:
+        """The files that held the baseline failures, relative to the session root.
+
+        Test ids look like ``tests/test_x.py::test_y`` (pytest) or a bare path, and
+        are relative to the directory the runner used, which is not always the
+        repository root.
+        """
+        prefix = (session.runner_directory or "").strip("/")
+        files: list[str] = []
+        for node in session.baseline.get("failing") or [] if session.baseline else []:
+            path = str(node).split("::", 1)[0].strip()
+            if not path or "/" not in path and "." not in path:
+                continue
+            relative = f"{prefix}/{path}" if prefix else path
+            if relative not in files:
+                files.append(relative)
+        return files
+
+    def check(self, session: SolveSession, *, require_new_test: bool = False,
+              allow_test_edits: bool = False) -> GateResult:
         """Decide whether the issue is solved: tests pass, the baseline improved, something changed."""
         checks: list[dict[str, Any]] = []
         reasons: list[str] = []
@@ -474,6 +554,21 @@ class SolveCoordinator:
                                       if fixed else "no previously failing test passes yet")})
             if not improved:
                 reasons.append("None of the tests that failed at the start pass now.")
+
+            # A test that was rewritten cannot also be the proof. Without this the gate
+            # would accept "make the assertion match the bug".
+            rewritten = sorted(set(self._failing_test_files(session)) & set(changed))
+            if not allow_test_edits:
+                checks.append({"name": "tests-intact", "ok": not rewritten,
+                               "detail": ("the failing test(s) were not modified" if not rewritten else
+                                          f"the proof itself was edited: {', '.join(rewritten[:3])}")})
+                if rewritten:
+                    reasons.append(f"{', '.join(rewritten[:3])} held the failing test(s), and it was modified, so "
+                                   "a pass proves nothing. Fix the implementation instead, or re-run with "
+                                   "--allow-test-edits if the test really was wrong.")
+            elif rewritten:
+                checks.append({"name": "tests-intact", "ok": True,
+                               "detail": f"allowed: {', '.join(rewritten[:3])} was modified"})
         else:
             # Nothing failed at the start, so a passing suite proves nothing on its own:
             # the change has to bring a test that covers it.
@@ -540,7 +635,7 @@ class SolveCoordinator:
         """
         status = self._git(session, "status", "--porcelain", "--untracked-files=all")
         if status is None:
-            return sorted({path for edit in session.edits for path in edit["files"]})
+            return self._snapshot_changes(session)
         toplevel = self._toplevel(session) or session.path
         files: set[str] = set()
         for line in status.splitlines():
@@ -556,6 +651,29 @@ class SolveCoordinator:
             except ValueError:
                 continue  # changed outside the repository the model was given
         return sorted(files)
+
+    def _snapshot_changes(self, session: SolveSession) -> list[str]:
+        """Files differing from the index that was captured when the session started.
+
+        This is the fallback when the repository is not under git, and it matters:
+        a model usually edits files with its own tools rather than through ``apply``
+        or ``write``, and the gate has to see those edits too. Every indexed file
+        already carries a SHA-256 from solve time, so the comparison is free.
+        """
+        indexed = {record.path: record.sha256 for record in self.store.list_files(session.repository_id)}
+        changed = {path for edit in session.edits for path in edit["files"]}
+        try:
+            current = self.scanner.scan(session.path).files
+        except OSError as exc:  # unreadable tree: fall back to what we recorded ourselves
+            logger.warning("Could not re-scan the workspace", extra={"session": session.id, "error": str(exc)})
+            return sorted(path for path in changed if not _is_artifact(path))
+        seen = set()
+        for file in current:
+            seen.add(file.path)
+            if indexed.get(file.path) != file.sha256:
+                changed.add(file.path)  # edited by the model, or newly added
+        changed |= set(indexed) - seen  # deleted since the session started
+        return sorted(path for path in changed if not _is_artifact(path))
 
     def diff(self, session: SolveSession) -> str:
         """A unified diff of the work so far (git when available, else the recorded writes)."""

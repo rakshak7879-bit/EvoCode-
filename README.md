@@ -55,8 +55,13 @@ Give Evo Code an issue and it does the parts a model is weakest at, then judges 
 ./evo --json check --session S                      # the gate: exit 0 solved, exit 2 not yet
 ```
 
-The gate only passes when real source files changed, the whole suite passes, and a test that failed
-at the start now passes — or, when nothing failed at the start, the change brings a test with it.
+The gate only passes when real source files changed, the whole suite passes, a test that failed
+at the start now passes — or, when nothing failed at the start, the change brings a test with it —
+and the failing test itself was not rewritten. That last check matters: editing the assertion until
+it matches the bug turns the suite green without fixing anything, so the gate refuses it.
+
+The model can send a patch or just edit the files with its own tools; changes are found by comparing
+against the SHA-256 recorded for every file when `solve` ran, so neither git nor `apply` is required.
 Runners are detected automatically (pytest, unittest, npm, go, cargo), including suites that live in
 a subdirectory such as `backend/` or `packages/api/`. Full contract, JSON shapes and exit codes:
 [HARNESS.md](HARNESS.md).

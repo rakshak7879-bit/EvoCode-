@@ -100,14 +100,19 @@ test before fixing anything.
 ```
 
 Patch rules that avoid the common failures:
-- Paths must be **relative to the `--repo` you passed to `solve`** (`a/repo/text.py`, `-p1` style).
-- Include a `diff --git a/... b/...` header for each file.
+- Paths must be **relative to the `--repo` you passed to `solve`**.
+- Any unified diff works: `git diff` style with a `diff --git` header, or the plain
+  `--- a/file` / `+++ b/file` that `diff -u` and `difflib` produce. Prefixes are
+  optional — `--- src/app.py` is read as `src/app.py`, not `app.py`.
 - Context lines must match the file exactly. If `apply` reports *"The patch does not apply"*,
   re-read the file (`./evo source ...` or plain `cat`) and rebuild the diff.
 - A patch that applies but changes nothing is rejected, so a silent no-op can't look like success.
 
-You can also just edit the files yourself with your own tools. In `live` mode the
-session points at the real repository, and `check` will pick the changes up.
+You can also just edit the files yourself with your own tools, which is usually simpler.
+In `live` mode the session points at the real repository and `check` picks the changes up:
+it compares the current files against the SHA-256 of every file recorded when `solve` ran,
+so edits are detected whether or not the repository is under git, and whether or not they
+went through `apply`.
 
 ### `test` — run the repository's own tests
 
@@ -133,21 +138,28 @@ paths you pass with `--tests` stay repository-relative — Evo Code rewrites the
 ### `check` — the gate
 
 ```bash
-./evo --json check --session S [--require-new-test] [--save-patch]
+./evo --json check --session S [--require-new-test] [--save-patch] [--allow-test-edits]
 ```
 
-Three checks must all pass:
+Every check must pass:
 
 | Check | Passes when |
 | --- | --- |
 | `changes` | real source files changed (generated files like `__pycache__` don't count) |
 | `tests` | the whole suite passes |
 | `baseline` | a test that failed at the start now passes — or, if nothing failed at the start, the change adds a test |
+| `tests-intact` | the failing test that proves the issue was **not** rewritten |
 
-That last rule matters: when `solve` could not reproduce the issue, a green suite proves nothing on
+The `baseline` rule matters: when `solve` could not reproduce the issue, a green suite proves nothing on
 its own, so the gate asks for a test that fails without your fix and passes with it. Evo Code tells
 coverage from implementation by directory and naming evidence, so a module that merely happens to be
 called `test_runner.py` does not count.
+
+`tests-intact` closes the obvious shortcut. Editing the failing assertion until it matches the bug
+makes the suite green without fixing anything, so the gate refuses it and names the file. Adding
+*new* tests is always fine — only the files holding the baseline failures are protected. If the
+test genuinely was wrong, `--allow-test-edits` records that as a deliberate decision rather than
+hiding it.
 
 `--require-new-test` also demands a test when the baseline *did* fail. Exit code `0` means solved,
 `2` means not yet, and `reasons` says exactly what is missing.
@@ -220,9 +232,25 @@ $ ./evo --json apply --session d2cd91103a60 --patch fix.patch
 
 $ ./evo --json check --session d2cd91103a60 | jq '{status, checks:[.checks[]|{name,ok}]}'
 { "status": "pass",
-  "checks": [ {"name":"changes","ok":true}, {"name":"tests","ok":true}, {"name":"baseline","ok":true} ] }
+  "checks": [ {"name":"changes","ok":true}, {"name":"tests","ok":true},
+              {"name":"baseline","ok":true}, {"name":"tests-intact","ok":true} ] }
 $ echo $?
 0
+```
+
+And the same gate refusing a shortcut, where the failing assertion was edited to match
+the bug instead of the bug being fixed:
+
+```bash
+$ ./evo --no-color check --session 9f1c2a4b7d10
+  ✓ changes    1 file(s) changed
+  ✓ tests      pytest: 13 passed (148ms)
+  ✓ baseline   1 previously failing test(s) now pass: tests/test_discounts.py::test_discount_rounds_half_up
+  ✗ tests-intact the proof itself was edited: tests/test_discounts.py
+  FAIL · 1 file(s) changed
+    - tests/test_discounts.py held the failing test(s), and it was modified, so a pass proves nothing.
+$ echo $?
+2
 ```
 
 Full CLI reference: [CLI.md](CLI.md). Architecture: [ARCHITECTURE.md](ARCHITECTURE.md).

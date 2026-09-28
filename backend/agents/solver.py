@@ -206,6 +206,68 @@ def _symbol_window(file: SourceFile, line: int) -> tuple[int, int, str | None]:
     return max(1, line - 5), min(len(file.lines), line + 15), None
 
 
+#: ``E  +  where 52 = discount_amount(...)`` — pytest naming the call that produced the wrong value.
+_ASSERT_SOURCE = re.compile(r"where\s+.+?=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+#: The failing statement itself, which pytest marks with ``>``.
+_STATEMENT = re.compile(r"^[>E]\s")
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+#: Words that appear in failure output without pointing at any implementation.
+_NOISE = frozenset({
+    "assert", "assertion", "assertionerror", "error", "self", "def", "return", "true", "false", "none",
+    "not", "and", "or", "in", "is", "if", "else", "for", "while", "import", "from", "class", "raise",
+    "with", "as", "lambda", "expect", "tobe", "equal", "e", "at", "the", "of", "to",
+})
+
+
+def failure_signals(output: str) -> dict[str, float]:
+    """Weigh identifiers by how strongly the test output blames them.
+
+    Test runners say more than "this failed". pytest's assertion introspection
+    reports ``where <bad value> = <call>(...)``, which names the function that
+    produced the wrong result — usually the one that needs changing. That gets the
+    most weight; identifiers in the failing statement get less. Without this, a
+    short data-class name can outrank the function with the actual defect simply
+    because the issue text happens to use the same word.
+    """
+    weights: dict[str, float] = {}
+
+    def add(name: str, weight: float) -> None:
+        if len(name) > 2 and name.lower() not in _NOISE:
+            weights[name] = weights.get(name, 0.0) + weight
+
+    for line in output.splitlines():
+        if not _STATEMENT.match(line):
+            continue
+        for match in _ASSERT_SOURCE.finditer(line):
+            add(match.group(1), 3.0)
+        if line.startswith(">"):
+            for match in _IDENTIFIER.finditer(line):
+                add(match.group(0), 1.5)
+    return weights
+
+
+def rerank_by_failure(suspects: list[Suspect], output: str) -> list[Suspect]:
+    """Re-order suspects using the blame the test runner already reported.
+
+    Returns a new list; scores and reasons are updated on copies so the original
+    ranking stays intact for callers that want it.
+    """
+    weights = failure_signals(output)
+    if not weights or not suspects:
+        return list(suspects)
+    ranked: list[Suspect] = []
+    for suspect in suspects:
+        bonus = weights.get(suspect.symbol or "", 0.0)
+        if bonus <= 0:
+            ranked.append(suspect)
+            continue
+        reasons = [*suspect.reasons, "the failing test blames this call"]
+        ranked.append(suspect.model_copy(update={"score": round(suspect.score + bonus, 2),
+                                                 "reasons": reasons[:5]}))
+    ranked.sort(key=lambda s: (-s.score, s.file, s.line_start))
+    return ranked
+
+
 def locate_suspects(context: AgentContext, analysis: dict[str, Any], limit: int = MAX_SUSPECTS) -> list[Suspect]:
     """Rank code that most likely needs to change, using memory search plus issue signals."""
     scores: dict[tuple[str, int, int], dict[str, Any]] = {}
@@ -335,6 +397,9 @@ class SolverAgent(BaseAgent):
         suspects: list[Suspect] = team.value("locator", [])
         scout = team.value("scout", {"runners": [], "tests": [], "runner": None})
         baseline: TestReport | None = team.value("reproducer")
+        if baseline is not None and baseline.status == "failed":
+            # Same ordering the plan used, so the JSON and the steps agree.
+            suspects = rerank_by_failure(suspects, baseline.output)
         plan = team.value("planner", {"steps": [], "strategy": ""})
         refinement: LLMRefinement | None = team.value("llm_reviewer")
 
@@ -458,6 +523,8 @@ class SolverAgent(BaseAgent):
         suspects: list[Suspect] = upstream["locator"].value
         scout = upstream["scout"].value if "scout" in upstream else {"runner": None, "tests": []}
         baseline: TestReport | None = upstream["reproducer"].value if "reproducer" in upstream else None
+        if baseline is not None and baseline.status == "failed":
+            suspects = rerank_by_failure(suspects, baseline.output)
         steps: list[Step] = []
 
         def add(action: str, detail: str = "", suspect: Suspect | None = None) -> None:
@@ -476,9 +543,12 @@ class SolverAgent(BaseAgent):
             target = f"`{suspect.symbol}`" if suspect.symbol else "this range"
             add(f"Inspect {target} in {suspect.file}", f"{where} — {'; '.join(suspect.reasons) or 'ranked by memory'}",
                 suspect)
-        # Prefer a named symbol the issue actually mentions over a whole-file window.
+        # Prefer whatever the failing test blamed; otherwise a named symbol the issue
+        # mentions, and only then the top-ranked window.
+        blamed = failure_signals(baseline.output) if baseline is not None else {}
         named = {term.lower() for term in (analysis.get("term_weights") or analysis["terms"])}
-        primary = next((s for s in suspects if s.symbol and s.symbol.lower() in named), None) or \
+        primary = next((s for s in suspects if s.symbol and s.symbol in blamed), None) or \
+            next((s for s in suspects if s.symbol and s.symbol.lower() in named), None) or \
             next((s for s in suspects if s.symbol), None) or (suspects[0] if suspects else None)
         if primary:
             add(f"Change {f'`{primary.symbol}`' if primary.symbol else primary.file} to satisfy the expected behavior",

@@ -161,9 +161,14 @@ listed with the reason instead of being patched.
 ```
 
 `solve` never changes code: it breaks the issue down, ranks the suspect code with verified
-citations, detects the test runner and captures the failing baseline. Writing the patch is the
-model's (or your) job; `check` decides whether it worked. Exit codes and JSON shapes are in
-[HARNESS.md](HARNESS.md).
+citations, detects the test runner and captures the failing baseline. When the baseline fails, the
+ranking is sharpened with the runner's own blame — pytest reports `where <wrong value> = <call>(...)`,
+and that call is promoted to the top suspect, so the plan names the function with the defect rather
+than whichever symbol happens to share a word with the issue text.
+
+Writing the patch is the model's (or your) job; `check` decides whether it worked, and refuses a
+green suite that was achieved by editing the failing test (`--allow-test-edits` overrides it
+deliberately). Exit codes and JSON shapes are in [HARNESS.md](HARNESS.md).
 
 ### Optional deep security scan
 

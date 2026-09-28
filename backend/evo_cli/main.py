@@ -216,6 +216,8 @@ def _add_solve_commands(sub: argparse._SubParsersAction) -> None:  # type: ignor
     check.add_argument("--session", help="session id or prefix (default: the most recent)")
     check.add_argument("--require-new-test", action="store_true", help="also require a test to be added or changed")
     check.add_argument("--save-patch", action="store_true", help="write the changes to a .patch file")
+    check.add_argument("--allow-test-edits", action="store_true",
+                       help="accept a fix even if it modified the failing test (off by default)")
     check.add_argument("--output", type=int, default=0, help="also print the last N lines of test output")
 
 
@@ -549,7 +551,8 @@ async def dispatch_solve(args: argparse.Namespace, services: Services, console: 
         return EXIT_OK
 
     if command == "check":
-        gate = coordinator.check(session, require_new_test=args.require_new_test)
+        gate = coordinator.check(session, require_new_test=args.require_new_test,
+                                 allow_test_edits=args.allow_test_edits)
         patch_path = coordinator.save_patch(session) if args.save_patch else None
         if args.json:
             console.write(json.dumps({"session": session.id, **gate.to_dict(),
